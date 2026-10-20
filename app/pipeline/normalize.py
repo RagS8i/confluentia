@@ -175,8 +175,17 @@ def _build_source(
 def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord], List[str]]:
     if not isinstance(payload, dict):
         raise InputError("malformed_payload", "STT payload must be a JSON object")
-    segments = payload.get("segments") or payload.get("results") or []
-    top_text = payload.get("text") or payload.get("transcript")
+    segments = (
+        payload.get("segments")
+        or payload.get("results")
+        or payload.get("chunks")
+        or []
+    )
+    top_text = (
+        payload.get("text")
+        or payload.get("transcript")
+        or payload.get("translated_text")
+    )
     if not segments and not top_text:
         raise InputError("empty_transcript", "STT payload contains no transcript text")
     if segments and not isinstance(segments, list):
@@ -186,6 +195,7 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
         payload.get("language")
         or payload.get("language_code")
         or payload.get("lang")
+        or payload.get("target_language")
     )
     status = payload.get("language_status")
     captured = _parse_dt(payload.get("captured_at") or payload.get("recorded_at"))
@@ -199,7 +209,12 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
             if not isinstance(segment, dict):
                 notes.append(f"segment_{index}_invalid")
                 continue
-            text = segment.get("text") or segment.get("transcript") or ""
+            text = (
+                segment.get("text")
+                or segment.get("transcript")
+                or segment.get("translated_text")
+                or ""
+            )
             original = str(text)
             normalized = normalize_text(original)
             if not normalized:
@@ -213,16 +228,32 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                     segment_id=f"s{index}",
                     original=original,
                     normalized=normalized,
-                    declared_language=segment.get("language") or declared,
+                    declared_language=(
+                        segment.get("language")
+                        or segment.get("language_code")
+                        or declared
+                    ),
                     source_language_status=segment.get("language_status") or status,
                     confidence=_norm_confidence(
-                        segment.get("confidence", payload.get("confidence"))
+                        segment.get(
+                            "confidence",
+                            segment.get(
+                                "language_probability",
+                                payload.get("confidence"),
+                            ),
+                        )
                     ),
                     document_ref=None,
                     page=None,
                     bbox=None,
-                    audio_start=segment.get("start", segment.get("start_time")),
-                    audio_end=segment.get("end", segment.get("end_time")),
+                    audio_start=segment.get(
+                        "start",
+                        segment.get("start_time", segment.get("start_seconds")),
+                    ),
+                    audio_end=segment.get(
+                        "end",
+                        segment.get("end_time", segment.get("end_seconds")),
+                    ),
                     captured_at=captured,
                     parent_source_id=parent,
                     raw_metadata={
@@ -347,6 +378,27 @@ def adapt_ocr(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                 page_no = page_index + 1
             page_conf = _norm_confidence(page.get("confidence"))
             blocks = page.get("blocks") or page.get("lines") or []
+            if not blocks and "model_output" in page and isinstance(page["model_output"], dict):
+                try:
+                    from OCR1.ocr_text import _block_order, _blocks, _page_text, _text_from_block
+
+                    p_blocks = _blocks(page["model_output"])
+                    if p_blocks:
+                        ordered = sorted(p_blocks, key=_block_order)
+                        for pb in ordered:
+                            t = _text_from_block(pb)
+                            if t:
+                                blocks.append({
+                                    "text": t,
+                                    "bbox": pb.get("bbox") or pb.get("box"),
+                                    "confidence": _norm_confidence(pb.get("confidence") or pb.get("score")),
+                                    "label": pb.get("block_label"),
+                                })
+                    if not blocks:
+                        for t in _page_text(page["model_output"]):
+                            blocks.append({"text": t, "confidence": page_conf})
+                except Exception:
+                    pass
             if blocks and isinstance(blocks, list):
                 for block in blocks:
                     if not isinstance(block, dict):

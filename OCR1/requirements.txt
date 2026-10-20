@@ -1,0 +1,16 @@
+# Careflow OCR service dependencies.
+fastapi==0.151.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+pydantic==2.14.1
+
+# PaddleOCR-VL. On Linux/CUDA, replace paddlepaddle with the matching
+# paddlepaddle-gpu build. 3.3.1 has no Linux aarch64 wheel; 3.2.2 is the
+# newest one that does.
+paddleocr==3.7.0
+# PaddleOCR-VL-1.6 lives in PaddleX and requires its "ocr" extras; the base
+# paddleocr dependency alone does not install them.
+paddlex[ocr]==3.7.2
+paddlepaddle==3.3.1; platform_machine != "aarch64"
+paddlepaddle==3.2.2; platform_machine == "aarch64"
+pillow==13.0.0
