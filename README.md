@@ -53,6 +53,8 @@ Principal components:
 - `app/db.py`, `app/storage.py`, `app/deletion.py` - SQLite persistence, encryption, deletion jobs.
 - `app/security.py` - development header auth / API-key auth and case-level access control.
 - `app/static/` - responsive dependency-free review and coordination UI.
+- `OCR1/` - PaddleOCR-VL document OCR microservice and reading-order layout extraction.
+- `STT_translation/` - Sarvam speech-to-language transcription and translation microservice.
 - `mobile/` - Flutter client for Android and iOS.
 
 More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/STT_OCR_INTEGRATION.md](docs/STT_OCR_INTEGRATION.md), [docs/RULE_GOVERNANCE.md](docs/RULE_GOVERNANCE.md).
@@ -84,6 +86,18 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Open `http://127.0.0.1:8000/`. The UI uses development header auth by default; set `X-User-Id`, `X-Role` and (for patients) `X-Patient-Id` through the UI or API client.
 
+### Speech-to-Text microservice (Sarvam)
+
+```powershell
+uvicorn STT_translation.api:app --host 127.0.0.1 --port 8001
+```
+
+### OCR microservice (PaddleOCR-VL)
+
+```powershell
+uvicorn OCR1.api:app --host 127.0.0.1 --port 8002
+```
+
 ### Flutter app
 
 ```powershell
@@ -99,15 +113,14 @@ The Flutter client provides queue intelligence, operational bottlenecks and staf
 ### Run tests
 
 ```powershell
+# Python unit, pipeline, security, and integration tests
 python -m pytest -q
+
+# Flutter mobile tests and analysis
 cd mobile
 flutter test
 flutter analyze
 cd ..
-```
-
-```powershell
-python -m pytest -q
 ```
 
 Tests use `MockProvider`, temporary databases and synthetic text only. They do not call Ollama.
@@ -230,8 +243,10 @@ Consent must be granted before ingestion/processing. In the demo, `intake` or `a
 
 ```
 app/                 FastAPI app, pipeline, model providers, rules, website
+OCR1/                PaddleOCR-VL OCR microservice and reading order parser
+STT_translation/     Sarvam speech-to-language transcription microservice
 mobile/              Flutter client (Android/iOS)
-tests/               pytest suite (synthetic data, mock provider)
+tests/               pytest suite (synthetic data, mock provider, integration)
 scripts/             extraction benchmark, rule-config validator
 docs/                architecture, integration and governance notes
 data/                runtime data (gitignored)
