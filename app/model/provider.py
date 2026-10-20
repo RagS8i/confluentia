@@ -58,6 +58,15 @@ class OllamaProvider(BaseProvider):
         self.model = settings.ollama_model
         self.base_url = settings.ollama_base_url
         self._extraction_schema = ExtractionResult.model_json_schema()
+        # ExtractedFact has defaults for these safety-critical fields, so
+        # Pydantic omits them from ``required``. Structured-output models then
+        # drop them and the server silently applies "unknown"/"patient_reported".
+        fact_schema = self._extraction_schema.get("$defs", {}).get("ExtractedFact")
+        if fact_schema is not None:
+            required = fact_schema.setdefault("required", [])
+            for field_name in ("status", "assertion"):
+                if field_name not in required:
+                    required.append(field_name)
         self._draft_schema = {
             "type": "object",
             "properties": {

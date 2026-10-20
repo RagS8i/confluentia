@@ -282,3 +282,15 @@ def test_override_and_assignment_require_confirmation_and_warnings_survive(clien
     assert warning_id in persisted
     assert persisted[warning_id]["status"] == "acknowledged"
     assert set(persisted).issuperset(set(warnings))
+
+
+def test_extraction_schema_requires_safety_fields(tmp_path):
+    from app.config import Settings
+    from app.model.provider import OllamaProvider
+
+    provider = OllamaProvider(
+        Settings(data_dir=tmp_path, db_path=tmp_path / "careflow.db")
+    )
+    required = provider._extraction_schema["$defs"]["ExtractedFact"]["required"]
+    assert "status" in required
+    assert "assertion" in required

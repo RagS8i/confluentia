@@ -105,11 +105,14 @@ def test_upload_requires_consent(client):
     assert response.status_code == 409
 
 
-def test_empty_source_is_not_reassuring(client):
+def test_empty_source_is_rejected_and_never_reassuring(client):
     case_id = new_case(client)
     consent(client, case_id)
     response = ingest_stt(client, case_id, stt_payload("   ", transcript_id="stt_empty"))
-    assert response.status_code == 200, response.text
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "empty_transcript"
+    assert detail(client, case_id)["sources"] == []
+
     process(client, case_id)
     data = detail(client, case_id)
     assert data["case"]["workflow_status"] == "UNASSESSED"

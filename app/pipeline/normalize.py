@@ -293,7 +293,9 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
             )
         )
     if not records:
-        notes.append("empty_transcript")
+        raise InputError(
+            "empty_transcript", "STT payload contains no usable transcript text"
+        )
     return records, notes
 
 
@@ -390,7 +392,7 @@ def adapt_ocr(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                             if t:
                                 blocks.append({
                                     "text": t,
-                                    "bbox": pb.get("bbox") or pb.get("box"),
+                                    "bbox": pb.get("bbox") or pb.get("box") or pb.get("block_bbox"),
                                     "confidence": _norm_confidence(pb.get("confidence") or pb.get("score")),
                                     "label": pb.get("block_label"),
                                 })
@@ -426,7 +428,9 @@ def adapt_ocr(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
         add(str(top_text), 1, None, _norm_confidence(payload.get("confidence")), 0)
 
     if not records:
-        notes.append("empty_document")
+        raise InputError(
+            "empty_document", "OCR payload contains no usable document text"
+        )
     return records, notes
 
 

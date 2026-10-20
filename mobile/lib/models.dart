@@ -6,6 +6,13 @@ List<Map<String, dynamic>> mapList(dynamic value) {
       .toList();
 }
 
+List<CaseSummary> caseSummariesFromResponse(dynamic value) {
+  final map = mapValue(value);
+  final items = map['items'];
+  final source = items is List ? items : value;
+  return mapList(source).map(CaseSummary.fromJson).toList();
+}
+
 Map<String, dynamic> mapValue(dynamic value) {
   if (value is Map) return Map<String, dynamic>.from(value);
   return <String, dynamic>{};

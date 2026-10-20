@@ -44,10 +44,57 @@ def _dump(model) -> str:
     return json.dumps(model, ensure_ascii=False, default=str)
 
 
+_SENSITIVE_METADATA_KEYS = {
+    "text",
+    "transcript",
+    "translated_text",
+    "content",
+    "block_content",
+    "quote",
+    "original_text",
+    "normalized_text",
+    "body",
+    "message",
+    "answer",
+}
+
+
+def _sanitize_metadata(value):
+    """Remove source text that upstream components may nest in metadata."""
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if key in _SENSITIVE_METADATA_KEYS:
+                if key in {"original_text", "normalized_text"} and item == "":
+                    cleaned[key] = ""
+                continue
+            cleaned[key] = _sanitize_metadata(item)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_metadata(item) for item in value]
+    return value
+
+
 class Database:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, cipher=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.cipher = cipher
+
+    def _encode_payload(self, value) -> str:
+        data = (
+            value.model_dump(mode="json")
+            if hasattr(value, "model_dump")
+            else value
+        )
+        if self.cipher is not None:
+            return self.cipher.encrypt_json(data)
+        return json.dumps(data, ensure_ascii=False, default=str)
+
+    def _decode_payload(self, payload: str):
+        if self.cipher is not None:
+            return self.cipher.decrypt_json(payload)
+        return json.loads(payload)
 
     @contextmanager
     def connect(self):
@@ -55,6 +102,7 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA secure_delete=ON")
         try:
             yield conn
             conn.commit()
@@ -272,6 +320,61 @@ class Database:
                 );
                 """
             )
+            migrated = self._encrypt_legacy_payloads(conn)
+            migrated += self._sanitize_legacy_source_metadata(conn)
+        if migrated:
+            # UPDATE leaves old plaintext pages in the freelist. Rewrite the
+            # database and truncate the WAL so the migrated copies are gone.
+            with self.connect() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            with self.connect() as conn:
+                conn.execute("VACUUM")
+            with self.connect() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def _encrypt_legacy_payloads(self, conn) -> int:
+        """Upgrade plaintext JSON payloads written by older builds.
+
+        Ciphertext begins with a Fernet prefix rather than ``{``/``[``, so the
+        detection is unambiguous. The update is idempotent.
+        """
+        if self.cipher is None:
+            return 0
+        migrated = 0
+        for table in ("warnings", "discrepancies", "summaries", "notes", "escalations"):
+            rows = conn.execute(f"SELECT rowid, payload FROM {table}").fetchall()
+            for row in rows:
+                raw = row["payload"]
+                if not isinstance(raw, str) or not raw.lstrip().startswith(("{", "[")):
+                    continue
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                conn.execute(
+                    f"UPDATE {table} SET payload=? WHERE rowid=?",
+                    (self.cipher.encrypt_json(data), row["rowid"]),
+                )
+                migrated += 1
+        return migrated
+
+    def _sanitize_legacy_source_metadata(self, conn) -> int:
+        migrated = 0
+        rows = conn.execute("SELECT rowid, metadata FROM sources").fetchall()
+        for row in rows:
+            try:
+                data = json.loads(row["metadata"])
+            except (TypeError, ValueError):
+                continue
+            sanitized = _sanitize_metadata(data)
+            if sanitized == data:
+                continue
+            conn.execute(
+                "UPDATE sources SET metadata=? WHERE rowid=?",
+                (json.dumps(sanitized, ensure_ascii=False), row["rowid"]),
+            )
+            migrated += 1
+        return migrated
 
     # ----------------------------------------------------------------- cases
     def save_case(self, record: CaseRecord) -> None:
@@ -347,7 +450,13 @@ class Database:
                 "normalized_text": source.normalized_text,
             }
         )
-        metadata = _dump(source.model_copy(update={"original_text": "", "normalized_text": ""}))
+        metadata = _dump(
+            _sanitize_metadata(
+                source.model_copy(
+                    update={"original_text": "", "normalized_text": ""}
+                ).model_dump(mode="json")
+            )
+        )
         with self.connect() as conn:
             existing = conn.execute(
                 "SELECT content_hash FROM sources WHERE source_id=?",
@@ -503,7 +612,9 @@ class Database:
                     (warning.warning_id,),
                 ).fetchone()
                 if existing:
-                    previous = Warning.model_validate_json(existing["payload"])
+                    previous = Warning.model_validate(
+                        self._decode_payload(existing["payload"])
+                    )
                     warning.status = previous.status
                 conn.execute(
                     """
@@ -527,7 +638,7 @@ class Database:
                         warning.rule_id,
                         warning.status.value,
                         warning.created_at.isoformat(),
-                        _dump(warning),
+                        self._encode_payload(warning),
                     ),
                 )
 
@@ -537,7 +648,10 @@ class Database:
                 "SELECT payload FROM warnings WHERE case_id=? ORDER BY created_at ASC",
                 (case_id,),
             ).fetchall()
-        return [Warning.model_validate_json(r["payload"]) for r in rows]
+        return [
+            Warning.model_validate(self._decode_payload(r["payload"]))
+            for r in rows
+        ]
 
     def acknowledge_warning(self, warning_id: str) -> bool:
         with self.connect() as conn:
@@ -546,11 +660,11 @@ class Database:
             ).fetchone()
             if not row:
                 return False
-            warning = Warning.model_validate_json(row["payload"])
+            warning = Warning.model_validate(self._decode_payload(row["payload"]))
             warning.status = warning.status.__class__.acknowledged
             conn.execute(
                 "UPDATE warnings SET status='acknowledged', payload=? WHERE warning_id=?",
-                (_dump(warning), warning_id),
+                (self._encode_payload(warning), warning_id),
             )
         return True
 
@@ -571,7 +685,7 @@ class Database:
                         item.category.value,
                         item.severity.value,
                         item.created_at.isoformat(),
-                        _dump(item),
+                        self._encode_payload(item),
                     ),
                 )
 
@@ -581,14 +695,21 @@ class Database:
                 "SELECT payload FROM discrepancies WHERE case_id=? ORDER BY created_at ASC",
                 (case_id,),
             ).fetchall()
-        return [Discrepancy.model_validate_json(r["payload"]) for r in rows]
+        return [
+            Discrepancy.model_validate(self._decode_payload(r["payload"]))
+            for r in rows
+        ]
 
     # --------------------------------------------------------------- summary
     def save_summary(self, summary: ClinicalSummary) -> None:
         with self.connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO summaries (case_id, updated_at, payload) VALUES (?,?,?)",
-                (summary.case_id, summary.generated_at.isoformat(), _dump(summary)),
+                (
+                    summary.case_id,
+                    summary.generated_at.isoformat(),
+                    self._encode_payload(summary),
+                ),
             )
 
     def get_summary(self, case_id: str) -> Optional[ClinicalSummary]:
@@ -596,13 +717,15 @@ class Database:
             row = conn.execute(
                 "SELECT payload FROM summaries WHERE case_id=?", (case_id,)
             ).fetchone()
-        return ClinicalSummary.model_validate_json(row["payload"]) if row else None
+        if not row:
+            return None
+        return ClinicalSummary.model_validate(self._decode_payload(row["payload"]))
 
     def save_note(self, case_id: str, note: DraftNote) -> None:
         with self.connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO notes (case_id, updated_at, payload) VALUES (?,?,?)",
-                (case_id, note.updated_at.isoformat(), _dump(note)),
+                (case_id, note.updated_at.isoformat(), self._encode_payload(note)),
             )
 
     def get_note(self, case_id: str) -> Optional[DraftNote]:
@@ -610,7 +733,9 @@ class Database:
             row = conn.execute(
                 "SELECT payload FROM notes WHERE case_id=?", (case_id,)
             ).fetchone()
-        return DraftNote.model_validate_json(row["payload"]) if row else None
+        if not row:
+            return None
+        return DraftNote.model_validate(self._decode_payload(row["payload"]))
 
     # ------------------------------------------------------- processing runs
     def save_run(self, run: ProcessingRun) -> None:
@@ -1067,7 +1192,7 @@ class Database:
                     escalation.attempts,
                     escalation.delivery,
                     escalation.last_error,
-                    _dump(escalation),
+                    self._encode_payload(escalation),
                 ),
             )
 
@@ -1077,7 +1202,11 @@ class Database:
                 "SELECT payload FROM escalations WHERE escalation_id=?",
                 (escalation_id,),
             ).fetchone()
-        return EscalationRecord.model_validate_json(row["payload"]) if row else None
+        if not row:
+            return None
+        return EscalationRecord.model_validate(
+            self._decode_payload(row["payload"])
+        )
 
     def find_escalation(self, dedupe_key: str) -> Optional[EscalationRecord]:
         with self.connect() as conn:
@@ -1085,7 +1214,11 @@ class Database:
                 "SELECT payload FROM escalations WHERE dedupe_key=?",
                 (dedupe_key,),
             ).fetchone()
-        return EscalationRecord.model_validate_json(row["payload"]) if row else None
+        if not row:
+            return None
+        return EscalationRecord.model_validate(
+            self._decode_payload(row["payload"])
+        )
 
     def get_escalations(
         self, case_id: Optional[str] = None, status: Optional[str] = None
@@ -1103,7 +1236,10 @@ class Database:
         query += " ORDER BY created_at ASC"
         with self.connect() as conn:
             rows = conn.execute(query, values).fetchall()
-        return [EscalationRecord.model_validate_json(row["payload"]) for row in rows]
+        return [
+            EscalationRecord.model_validate(self._decode_payload(row["payload"]))
+            for row in rows
+        ]
 
     def count_escalations(self, statuses: Iterable[str]) -> int:
         values = list(statuses)

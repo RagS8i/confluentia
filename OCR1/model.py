@@ -18,6 +18,13 @@ __all__ = ["SUPPORTED_EXTENSIONS", "extract_document", "get_ocr_pipeline"]
 @lru_cache(maxsize=1)
 def get_ocr_pipeline() -> Any:
     """Initialize the OCR model once and reuse it."""
+    # Paddle and PyTorch both ship a Windows ``shm.dll``. Importing Paddle
+    # first makes the later modelscope -> torch import fail with WinError 127.
+    # Preloading torch keeps both inference stacks loadable in one process.
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        pass
     try:
         from paddleocr import PaddleOCRVL
     except ImportError as exc:

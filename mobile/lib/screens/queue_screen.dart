@@ -42,7 +42,7 @@ class _QueueScreenState extends State<QueueScreen> {
         setState(() => _intelligence = parsed);
       } else {
         final data = await widget.api.get('/api/cases');
-        final list = mapList(data).map(CaseSummary.fromJson).toList();
+        final list = caseSummariesFromResponse(data);
         if (!mounted) return;
         setState(() {
           _cases = list;

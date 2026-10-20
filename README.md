@@ -86,13 +86,31 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Open `http://127.0.0.1:8000/`. The UI uses development header auth by default; set `X-User-Id`, `X-Role` and (for patients) `X-Patient-Id` through the UI or API client.
 
-### Speech-to-Text microservice (Sarvam)
+### Optional STT and OCR services
+
+Install their dependencies in the same environment, plus FFmpeg for audio
+decoding:
+
+```powershell
+pip install -r STT_translation/requirements.txt
+pip install -r OCR1/requirements.txt
+winget install --id Gyan.FFmpeg -e
+```
+
+PaddleOCR-VL downloads its layout and recognition models on first use into
+`%USERPROFILE%\.paddlex\official_models` (roughly 2 GB). CPU inference is
+functional but slow; install a matching `paddlepaddle-gpu` build for a
+supported CUDA/cuDNN setup if you need faster document processing.
+
+#### Speech-to-Text microservice (Sarvam)
+
+Requires `SARVAM_API_KEY` in `.env` and `ffmpeg` on `PATH`.
 
 ```powershell
 uvicorn STT_translation.api:app --host 127.0.0.1 --port 8001
 ```
 
-### OCR microservice (PaddleOCR-VL)
+#### OCR microservice (PaddleOCR-VL)
 
 ```powershell
 uvicorn OCR1.api:app --host 127.0.0.1 --port 8002
@@ -160,7 +178,7 @@ Configuration is read from environment variables and an optional `.env` file. Se
 | `CAREFLOW_OUTBOUND_TIMEOUT_S` | Outbound request timeout, default 10 seconds |
 | `CAREFLOW_WAIT_ESTIMATE_MIN_SAMPLE` | Minimum observed reviews before a wait estimate is allowed, default 3 |
 
-The default model name is configurable; this project does not bundle weights. This machine may only have `gemma4:26b` installed, so pull `qwen3:8b` before expecting real SLM output. Model quality has not been evaluated.
+The default model name is configurable; this project does not bundle weights. Pull the configured model before expecting real SLM output (`ollama pull qwen3:8b`). Model quality has not been clinically evaluated.
 
 ## API overview
 

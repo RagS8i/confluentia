@@ -121,6 +121,28 @@ void main() {
     expect(detail.meta['assigned_reviewer'], 'dr_a');
   });
 
+  test('case summaries parse the paginated API envelope', () {
+    final cases = caseSummariesFromResponse({
+      'items': [
+        {
+          'case_id': 'case_patient',
+          'patient_id': 'patient_a',
+          'status': 'processed',
+          'workflow_status': 'ROUTINE_REVIEW',
+          'consent': 'granted',
+          'overdue': false,
+          'warning_count': 1,
+        },
+      ],
+      'count': 1,
+    });
+
+    expect(cases, hasLength(1));
+    expect(cases.single.caseId, 'case_patient');
+    expect(cases.single.workflowStatus, 'ROUTINE_REVIEW');
+    expect(cases.single.warningCount, 1);
+  });
+
   testWidgets('status chip renders human-readable label', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

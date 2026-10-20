@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.pipeline.normalize import adapt_ocr, adapt_stt
+from app.pipeline.normalize import InputError, adapt_ocr, adapt_stt
 from OCR1.schemas import OcrDocument, OcrPage
 from OCR1.ocr_text import ocr_document_to_text
 from STT_translation.schemas import (
@@ -141,8 +141,7 @@ def test_adapt_ocr_with_ocr1_result():
                                 "block_label": "text",
                                 "block_content": "Pulse: 104 bpm",
                                 "block_order": 2,
-                                "bbox": [50, 90, 200, 120],
-                                "confidence": 0.95,
+                                "block_bbox": [50, 90, 200, 120],
                             },
                         ]
                     }
@@ -159,7 +158,7 @@ def test_adapt_ocr_with_ocr1_result():
     assert records[0].confidence == 0.96
     assert records[1].page == 1
     assert "Pulse: 104 bpm" in records[1].normalized_text
-    assert records[1].confidence == 0.95
+    assert records[1].bbox == [50.0, 90.0, 200.0, 120.0]
 
 
 def test_ocr1_health_and_validation():
@@ -197,3 +196,22 @@ def test_stt_translation_health_and_validation():
         files={"audio": ("empty.wav", b"", "audio/wav")},
     )
     assert empty_upload.status_code == 400
+
+def test_adapters_reject_payloads_with_no_usable_text():
+    """All-empty OCR/STT payloads must fail rather than enqueue an empty case."""
+    with pytest.raises(InputError) as stt_error:
+        adapt_stt(
+            {"transcript_id": "empty-stt", "segments": [{"text": "   "}]},
+            case_id="case_empty_stt",
+        )
+    assert stt_error.value.code == "empty_transcript"
+
+    with pytest.raises(InputError) as ocr_error:
+        adapt_ocr(
+            {
+                "document_id": "empty-ocr",
+                "pages": [{"page": 1, "blocks": [{"text": "\n\t"}]}],
+            },
+            case_id="case_empty_ocr",
+        )
+    assert ocr_error.value.code == "empty_document"

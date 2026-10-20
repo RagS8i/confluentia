@@ -23,10 +23,19 @@ clinical facts.
 RULES:
 1. Return ONLY a JSON object matching the supplied schema.
 2. Every fact must include original_text copied EXACTLY from a source.
+2b. original_text must be one contiguous substring. Never join separate clauses,
+   delete intervening words, or paraphrase.
 3. Never invent dates, measurements, units, medication names or findings.
 4. Preserve negation, timing, severity and uncertainty from the source.
-5. Use status "absent" ONLY for explicit negation such as "no fever" or "fever nahi".
-   If information is simply missing, do not create a fact and do not mark absent.
+5. Use status "present" for a symptom or finding the source states as current.
+   Use "unknown" only when the source does not make presence clear.
+5b. Use status "absent" ONLY for explicit negation such as "no fever",
+   "denies chest pain" or "fever nahi". For explicit negation also use
+   fact_type "explicit_negation". If information is simply missing, do not
+   create a fact and do not mark absent.
+5c. assertion must be "patient_reported" for typed/STT statements and
+   "document_derived" for OCR/document findings. Never use
+   "inferred_for_review" when original_text is an exact quote.
 6. Use status "historical" for past/stopped conditions or medications.
 7. If the meaning is ambiguous, use status "uncertain" and add a note.
 8. Normalized labels may be English; original_text must stay in the source language.

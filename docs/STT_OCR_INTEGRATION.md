@@ -10,6 +10,8 @@ Endpoints:
 
 Consent is required. Ingesting the same payload twice is idempotent: stable source IDs are reported under `duplicates` instead of creating duplicate sources.
 
+The microservice outputs can be posted directly to CareFlow: STT results are read from `chunks`/`transcription` with `start_seconds`/`end_seconds`, and OCR results are read from `pages[].model_output.parsing_res_list` with `block_content`/`block_bbox`.
+
 ## STT payload
 
 ```json

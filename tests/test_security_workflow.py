@@ -7,8 +7,10 @@ from .conftest import (
     consent,
     detail,
     facts_with_label,
+    ingest_ocr,
     ingest_stt,
     new_case,
+    ocr_payload,
     patient_headers,
     process,
     stt_payload,
@@ -207,3 +209,47 @@ def test_17_consent_withdrawal_deletes_clinical_content_and_retains_audit(client
 
     uploads = list((client.app.state.settings.uploads_dir).glob("*"))
     assert uploads == []
+
+
+def test_clinical_text_is_encrypted_at_rest(client, tmp_path):
+    case_id = _case_with_facts(client, patient_id="patient_encrypted")
+    ingest_ocr(
+        client,
+        case_id,
+        ocr_payload(
+            [
+                {
+                    "page": 1,
+                    "confidence": 0.95,
+                    "blocks": [
+                        {
+                            "text": "Patient reports unique OCR marker for encryption.",
+                            "bbox": [1, 2, 30, 40],
+                            "confidence": 0.95,
+                        }
+                    ],
+                }
+            ],
+            document_id="encrypted-ocr",
+        ),
+    )
+    process(client, case_id)
+    data = detail(client, case_id)
+    assert any(
+        "chest pain and shortness of breath" in fact["original_text"].lower()
+        for fact in data["facts"]
+    )
+    client.post(
+        f"/api/cases/{case_id}/communications/draft",
+        headers=CLINICIAN,
+        json={"intent": "urgent_review", "language": "en"},
+    )
+
+    db_bytes = (tmp_path / "careflow.db").read_bytes()
+    wal_path = tmp_path / "careflow.db-wal"
+    if wal_path.exists():
+        db_bytes += wal_path.read_bytes()
+    assert b"chest pain and shortness of breath" not in db_bytes
+    assert b"unique OCR marker for encryption" not in db_bytes
+    assert b"co-occurring chest pain" not in db_bytes
+    assert b"not a diagnosis" not in db_bytes

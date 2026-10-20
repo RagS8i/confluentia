@@ -1441,9 +1441,9 @@ def create_app(
     engine: Optional[RuleEngine] = None,
 ) -> FastAPI:
     settings = settings or load_settings()
-    db = Database(settings.db_path)
-    db.init_schema()
     cipher = Cipher(settings)
+    db = Database(settings.db_path, cipher)
+    db.init_schema()
     documents = DocumentStore(settings, cipher)
     engine = engine or RuleEngine(settings.rules_path)
     provider = build_provider(settings, provider)
