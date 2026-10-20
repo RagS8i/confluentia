@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0d2533" />
+  <title>CareFlow AI — Clinical Review Workstation</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230d2533'/%3E%3Cpath d='M18 33h8l4-11 5 21 5-13h6' fill='none' stroke='%2385e7d6' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">CF</div>
+      <div>
+        <h1>CareFlow <span>AI</span></h1>
+        <p>Human-in-the-loop intake, communication and review</p>
+      </div>
+    </div>
+    <div class="identity">
+      <input id="user-id" aria-label="User ID" placeholder="User ID" />
+      <select id="role" aria-label="Role">
+        <option value="clinician">Clinician</option>
+        <option value="intake">Intake</option>
+        <option value="patient">Patient</option>
+        <option value="admin">Admin</option>
+      </select>
+      <input id="patient-id" aria-label="Patient ID" placeholder="Patient ID" />
+      <button id="save-identity" class="btn secondary">Set identity</button>
+    </div>
+  </header>
+
+  <div class="disclaimer">
+    <strong>Workflow support only.</strong> CareFlow AI does not diagnose, prescribe, or clear patients.
+    Demonstration rules are illustrative, not clinically approved. Urgent escalation never waits for messages or follow-up answers.
+  </div>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <section class="panel queue-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Review queue</h2>
+            <p class="eyebrow" id="queue-count">Priority categories are never auto-downgraded</p>
+          </div>
+          <div class="row compact">
+            <button id="refresh-queue" class="icon-btn" title="Refresh queue">↻</button>
+            <button id="new-case" class="btn small">New case</button>
+          </div>
+        </div>
+        <div id="queue" class="queue"></div>
+      </section>
+
+      <section class="panel intelligence-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Queue intelligence</h2>
+            <p class="eyebrow">Explainable, human-controlled prioritization</p>
+          </div>
+          <button id="refresh-intel" class="icon-btn" title="Refresh intelligence">↻</button>
+        </div>
+        <div id="bottlenecks" class="metrics"></div>
+        <details class="staffing-details">
+          <summary>Staffing &amp; wait estimate inputs</summary>
+          <div class="staffing-grid">
+            <label>Clinicians <input id="staff-clinicians" type="number" min="0" value="0" /></label>
+            <label>Avg review min <input id="staff-average" type="number" min="0" step="0.5" placeholder="unavailable" /></label>
+            <label>Sample size <input id="staff-sample" type="number" min="0" value="0" /></label>
+            <button id="save-staffing" class="btn secondary small">Update</button>
+          </div>
+          <p class="hint">A wait estimate appears only with clinicians, an average review time, and at least 3 observations. It is never a queue position.</p>
+        </details>
+        <div id="recommendations" class="recommendations"></div>
+      </section>
+
+      <section class="panel intake-panel">
+        <details>
+          <summary><span>Intake source data</span><span class="summary-note">STT / OCR / message</span></summary>
+          <p class="hint">Paste the output of an existing STT or OCR pipeline. Source text and metadata are preserved.</p>
+          <div class="row">
+            <button class="btn secondary small" data-ingest="stt">STT JSON</button>
+            <button class="btn secondary small" data-ingest="ocr">OCR JSON</button>
+            <button class="btn secondary small" data-ingest="message">Patient message</button>
+          </div>
+          <textarea id="ingest-json" rows="7" spellcheck="false" placeholder='{"transcript_id":"t1","language":"en","segments":[{"text":"I have chest pain since yesterday","start":0,"end":2.2,"confidence":0.93}]}'></textarea>
+          <div class="row">
+            <input id="upload-file" type="file" />
+            <button id="upload-btn" class="btn secondary small">Upload original</button>
+          </div>
+          <p id="ingest-status" class="hint"></p>
+        </details>
+      </section>
+    </aside>
+
+    <main class="main">
+      <section id="welcome" class="welcome">
+        <div class="welcome-copy">
+          <p class="eyebrow">Care coordination workspace</p>
+          <h2>One defensible view of every case</h2>
+          <p class="lede">Create a synthetic case, grant consent, add source material, and run the pipeline. Evidence stays attached to every claim, warning, message and follow-up.</p>
+          <div class="welcome-grid">
+            <article><span>01</span><h3>Evidence first</h3><p>Original wording is preserved. Missing information is never treated as a negative finding.</p></article>
+            <article><span>02</span><h3>Human control</h3><p>The deterministic engine proposes workflow status. A clinician makes the final decision.</p></article>
+            <article><span>03</span><h3>Safe outreach</h3><p>Patient messages come from curated templates and require staff approval before delivery.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section id="case-view" hidden>
+        <div class="case-header panel">
+          <div>
+            <p class="eyebrow">Case review</p>
+            <h2 id="case-title">Case</h2>
+            <p id="case-meta" class="hint"></p>
+          </div>
+          <div class="row">
+            <button id="refresh-case" class="btn secondary small">Refresh</button>
+            <button id="assign-btn" class="btn secondary small">Assign</button>
+            <button id="consent-btn" class="btn secondary small">Grant consent</button>
+            <button id="process-btn" class="btn small">Run pipeline</button>
+            <button id="withdraw-btn" class="btn danger small">Withdraw &amp; delete</button>
+          </div>
+        </div>
+
+        <div class="status-strip" id="status-strip"></div>
+
+        <section id="escalation-panel" class="panel escalation-panel" hidden>
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Urgent escalation outbox</p>
+              <h2>Immediate human review required</h2>
+            </div>
+          </div>
+          <div id="escalations"></div>
+        </section>
+
+        <section class="panel coordination-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Feature A · Patient queue communication</p>
+              <h2>Communication assistant</h2>
+              <p class="hint">Curated templates only. Draft → staff approval → delivery. No diagnosis, wait guarantee, or clearance is generated.</p>
+            </div>
+            <div class="row compact">
+              <select id="communication-intent" aria-label="Message intent">
+                <option value="status_update">Status update</option>
+                <option value="missing_information">Missing information</option>
+                <option value="document_request">Document request</option>
+                <option value="wait_update">Operational wait update</option>
+                <option value="urgent_review">Urgent review</option>
+              </select>
+              <select id="communication-language" aria-label="Message language">
+                <option value="en">English</option>
+                <option value="hi">हिन्दी</option>
+                <option value="hinglish">Hinglish</option>
+              </select>
+              <button id="draft-message" class="btn small">Draft</button>
+            </div>
+          </div>
+          <div id="communications" class="coordination-list"></div>
+        </section>
+
+        <div class="columns">
+          <div class="col">
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Feature C · Adaptive follow-up</p>
+                  <h2>Follow-up questions</h2>
+                </div>
+                <button id="sync-followups" class="btn secondary small">Sync from summary</button>
+              </div>
+              <div id="followups" class="coordination-list"></div>
+              <div id="followup-answers" class="answer-list"></div>
+            </section>
+
+            <section class="panel">
+              <h2>Clinical summary <span class="soft">evidence-linked</span></h2>
+              <div id="summary"></div>
+            </section>
+
+            <section class="panel">
+              <h2>Symptom timeline</h2>
+              <div id="timeline"></div>
+            </section>
+
+            <section class="panel">
+              <h2>Candidate contradictions</h2>
+              <div id="discrepancies"></div>
+            </section>
+
+            <section class="panel">
+              <h2>Structured facts &amp; source evidence</h2>
+              <div id="facts"></div>
+            </section>
+          </div>
+
+          <div class="col">
+            <section class="panel">
+              <h2>Warning signals</h2>
+              <div id="warnings"></div>
+            </section>
+
+            <section class="panel">
+              <h2>Missing information &amp; suggested questions</h2>
+              <div id="gaps"></div>
+              <div id="questions"></div>
+            </section>
+
+            <section class="panel">
+              <h2>Clinician note</h2>
+              <div id="note-status" class="hint"></div>
+              <textarea id="note-text" rows="12"></textarea>
+              <div class="row">
+                <button id="save-note" class="btn secondary small">Save draft</button>
+                <button id="approve-note" class="btn small">Approve note</button>
+              </div>
+              <div class="override">
+                <h3>Workflow status override</h3>
+                <p class="hint">Overrides preserve the original status, reviewer, timestamp and reason. Explicit confirmation is required.</p>
+                <div class="row">
+                  <select id="override-status">
+                    <option value="EMERGENCY">EMERGENCY</option>
+                    <option value="PRIORITY_REVIEW">PRIORITY_REVIEW</option>
+                    <option value="ROUTINE_REVIEW">ROUTINE_REVIEW</option>
+                    <option value="UNASSESSED">UNASSESSED</option>
+                  </select>
+                  <input id="override-reason" placeholder="Documented reason (required)" />
+                  <button id="override-btn" class="btn danger small">Override</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel">
+              <h2>Audit trail</h2>
+              <div id="audit" class="audit"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="row space-between">
+        <h2 id="modal-title">Evidence</h2>
+        <button id="modal-close" class="btn secondary small">Close</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

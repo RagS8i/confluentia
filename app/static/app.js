@@ -1,0 +1,951 @@
+"use strict";
+
+const state = {
+  identity: { userId: "dr_demo", role: "clinician", patientId: "patient_demo" },
+  caseId: null,
+  caseData: null,
+  intelligence: null,
+  pollTimer: null,
+  toastTimer: null,
+};
+
+const $ = (id) => document.getElementById(id);
+
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function badge(value) {
+  return `<span class="badge ${escapeHtml(value)}">${escapeHtml(value)}</span>`;
+}
+
+function loadIdentity() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("careflow.identity") || "null");
+    if (saved && saved.userId && saved.role) state.identity = saved;
+  } catch (_) {}
+  $("user-id").value = state.identity.userId;
+  $("role").value = state.identity.role;
+  $("patient-id").value = state.identity.patientId || "";
+}
+
+function identityHeaders() {
+  const headers = {
+    "X-User-Id": state.identity.userId,
+    "X-Role": state.identity.role,
+  };
+  if (state.identity.role === "patient") {
+    headers["X-Patient-Id"] = state.identity.patientId || state.identity.userId;
+  }
+  return headers;
+}
+
+async function api(path, options = {}) {
+  const opts = { ...options };
+  const headers = { ...identityHeaders(), ...(options.headers || {}) };
+  if (opts.body && !(opts.body instanceof FormData)) {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  opts.headers = headers;
+  const response = await fetch(`/api${path}`, opts);
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { detail: text }; }
+  if (!response.ok) {
+    let message = response.statusText;
+    if (data && data.detail) {
+      message = typeof data.detail === "string" ? data.detail : (data.detail.message || JSON.stringify(data.detail));
+    }
+    const error = new Error(message);
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
+  return data;
+}
+
+function setStatus(message, isError) {
+  $("ingest-status").textContent = message || "";
+  $("ingest-status").className = isError ? "error" : "hint";
+  notify(message, isError);
+}
+
+function notify(message, isError) {
+  if (!message) return;
+  const toast = $("toast");
+  toast.textContent = message;
+  toast.className = isError ? "toast error" : "toast";
+  toast.hidden = false;
+  if (state.toastTimer) clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => { toast.hidden = true; }, 4200);
+}
+
+function roleCanReview() {
+  return ["clinician", "admin"].includes(state.identity.role);
+}
+
+function saveIdentity() {
+  state.identity = {
+    userId: $("user-id").value.trim() || "user_demo",
+    role: $("role").value,
+    patientId: $("patient-id").value.trim(),
+  };
+  if (state.identity.role === "patient" && !state.identity.patientId) {
+    state.identity.patientId = state.identity.userId;
+  }
+  localStorage.setItem("careflow.identity", JSON.stringify(state.identity));
+  loadQueue();
+  loadIntelligence();
+}
+
+// ------------------------------------------------------------------- queue
+async function loadQueue() {
+  const container = $("queue");
+  container.innerHTML = '<p class="hint">Loading…</p>';
+  try {
+    const data = await api("/cases");
+    if (!data.items.length) {
+      container.innerHTML = '<p class="hint">No cases yet. Create one to begin.</p>';
+      return;
+    }
+    container.innerHTML = data.items.map((item) => {
+      const flags = [];
+      if (item.warning_count) flags.push(`${item.warning_count} warning(s)`);
+      if (item.contradiction_count) flags.push(`${item.contradiction_count} discrepancy(ies)`);
+      if (item.missing_info_count) flags.push(`${item.missing_info_count} gap(s)`);
+      if (item.processing_failures) flags.push(`${item.processing_failures} failure(s)`);
+      return `
+        <div class="queue-item ${escapeHtml(item.workflow_status)} ${item.case_id === state.caseId ? "active" : ""}"
+             data-case="${escapeHtml(item.case_id)}">
+          <div class="qid">${escapeHtml(item.case_id)}</div>
+          <div class="qmeta">
+            ${badge(item.workflow_status)} ${badge(item.status)}
+            ${item.overdue ? '<span class="badge EMERGENCY">overdue</span>' : ""}
+          </div>
+          <div class="qmeta">${escapeHtml(item.source_modalities.join(", ") || "no sources")} · consent: ${escapeHtml(item.consent)}
+            ${item.awaiting_minutes != null ? ` · waiting ${item.awaiting_minutes} min` : ""}</div>
+          <div class="qmeta">${escapeHtml(flags.join(" · ") || "no flags")}</div>
+        </div>`;
+    }).join("");
+    container.querySelectorAll("[data-case]").forEach((element) => {
+      element.addEventListener("click", () => loadCase(element.dataset.case));
+    });
+  } catch (error) {
+    container.innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+// ---------------------------------------------------------- intelligence
+async function loadIntelligence() {
+  const metrics = $("bottlenecks");
+  const recommendations = $("recommendations");
+  if (!roleCanReview() && state.identity.role !== "intake") {
+    metrics.innerHTML = "";
+    recommendations.innerHTML = '<p class="hint">Queue intelligence requires a staff role.</p>';
+    return;
+  }
+  try {
+    const data = await api("/queue/intelligence");
+    state.intelligence = data;
+    renderBottlenecks(data.bottlenecks);
+    renderRecommendations(data.items);
+    fillStaffing(data.staffing);
+  } catch (error) {
+    metrics.innerHTML = "";
+    recommendations.innerHTML = `<p class="hint">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderBottlenecks(summary) {
+  const cells = [
+    ["waiting", "Waiting", summary.total_waiting, false],
+    ["overdue", "Overdue", summary.overdue, summary.overdue > 0],
+    ["unassigned", "Unassigned", summary.unassigned, summary.unassigned > 0],
+    ["emergency", "Emergency", summary.emergency, summary.emergency > 0],
+    ["open", "Open escalations", summary.open_escalations, summary.open_escalations > 0],
+    ["followups", "Open follow-ups", summary.pending_followups, false],
+  ];
+  $("bottlenecks").innerHTML = cells.map(([key, label, value, alert]) =>
+    `<div class="metric ${alert ? "alert" : ""}" data-metric="${key}"><strong>${Number(value || 0)}</strong><span>${escapeHtml(label)}</span></div>`
+  ).join("");
+  const queueCount = $("queue-count");
+  if (queueCount && summary.oldest_waiting_minutes != null) {
+    queueCount.textContent = `Oldest active wait ${summary.oldest_waiting_minutes} min · no automatic reordering`;
+  }
+}
+
+function fillStaffing(staffing) {
+  if (!staffing) return;
+  if (document.activeElement !== $("staff-clinicians")) $("staff-clinicians").value = staffing.clinicians_available || 0;
+  if (document.activeElement !== $("staff-average")) {
+    $("staff-average").value = staffing.average_review_minutes == null ? "" : staffing.average_review_minutes;
+  }
+  if (document.activeElement !== $("staff-sample")) $("staff-sample").value = staffing.sample_size || 0;
+}
+
+function renderRecommendations(items) {
+  const container = $("recommendations");
+  if (!items || !items.length) {
+    container.innerHTML = '<p class="hint">No cases in the queue.</p>';
+    return;
+  }
+  container.innerHTML = items.map((item) => {
+    const estimate = item.wait_estimate && item.wait_estimate.available
+      ? `${item.wait_estimate.minimum_minutes}–${item.wait_estimate.maximum_minutes} min estimate`
+      : "wait estimate unavailable";
+    return `
+      <div class="recommendation" data-case="${escapeHtml(item.case_id)}">
+        <div class="recommendation-head">
+          <div>${badge(item.workflow_status)} <span class="badge">${escapeHtml(item.case_id)}</span></div>
+          <span class="score">score ${Number(item.score || 0).toFixed(1)}</span>
+        </div>
+        <div class="action">${escapeHtml(item.recommended_action)}</div>
+        <div class="qmeta small-text">${escapeHtml(estimate)}${item.overdue ? " · deadline passed" : ""}</div>
+      </div>`;
+  }).join("");
+  container.querySelectorAll("[data-case]").forEach((element) => {
+    element.addEventListener("click", () => loadCase(element.dataset.case));
+  });
+}
+
+async function saveStaffing() {
+  const averageRaw = $("staff-average").value.trim();
+  try {
+    const body = {
+      clinicians_available: Number($("staff-clinicians").value || 0),
+      intake_available: Number($("staff-clinicians").value || 0),
+      average_review_minutes: averageRaw === "" ? null : Number(averageRaw),
+      sample_size: Number($("staff-sample").value || 0),
+      note: "updated from workstation",
+    };
+    await api("/operations/staffing", { method: "PUT", body });
+    notify("Operational staffing inputs updated. Wait estimates are not guarantees.");
+    await loadIntelligence();
+    if (state.caseId) await loadCase(state.caseId);
+  } catch (error) {
+    notify(error.message, true);
+  }
+}
+
+// -------------------------------------------------------------------- case
+async function loadCase(caseId) {
+  state.caseId = caseId;
+  try {
+    const data = await api(`/cases/${encodeURIComponent(caseId)}`);
+    state.caseData = data;
+    $("welcome").hidden = true;
+    $("case-view").hidden = false;
+    renderCase(data);
+    loadQueue();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function renderCase(data) {
+  const c = data.case;
+  $("case-title").textContent = `Case ${c.case_id}`;
+  $("case-meta").textContent = `Patient ${c.patient_id} · received ${new Date(c.received_at).toLocaleString()} · assigned ${c.assigned_reviewer || "unassigned"}`;
+
+  const meta = c.meta || {};
+  const deadline = (meta.review_deadlines_minutes || {})[c.workflow_status];
+  const failures = (meta.processing_failures || []).length + (meta.stage_failures || []).length;
+  const estimate = data.queue_estimate;
+  const estimateText = estimate && estimate.available
+    ? `operational wait ${estimate.minimum_minutes}–${estimate.maximum_minutes} min (${estimate.confidence})`
+    : "wait estimate unavailable";
+  $("status-strip").innerHTML = `
+    ${badge(c.workflow_status)}
+    ${badge(c.status)}
+    <span class="badge">consent: ${c.consent_withdrawn_at ? "withdrawn" : c.consent_granted_at ? "granted" : "required"}</span>
+    <span class="badge">rules: ${escapeHtml(meta.rule_config_id || "n/a")} v${escapeHtml(meta.rule_config_version || "n/a")}</span>
+    <span class="badge">model: ${escapeHtml(meta.provider || "n/a")} / ${escapeHtml(meta.model || "n/a")}</span>
+    <span class="badge">facts: ${meta.fact_count != null ? meta.fact_count : "0"}</span>
+    <span class="badge">sources: ${meta.usable_source_count != null ? meta.usable_source_count : "0"}</span>
+    ${deadline != null ? `<span class="badge">review deadline: ${deadline} min</span>` : ""}
+    <span class="badge">${escapeHtml(estimateText)}</span>
+    ${failures ? `<span class="badge EMERGENCY">${failures} processing failure(s)</span>` : ""}
+    ${meta.summary_stale ? '<span class="badge PRIORITY_REVIEW">summary stale after correction</span>' : ""}
+    <span class="badge">${escapeHtml(meta.rule_config_status || "illustrative")}</span>
+  `;
+  $("consent-btn").disabled = Boolean(c.consent_withdrawn_at || c.deleted_at);
+  $("process-btn").disabled = Boolean(c.consent_withdrawn_at || c.deleted_at);
+  $("assign-btn").disabled = !roleCanReview();
+  $("draft-message").disabled = !roleCanReview();
+  $("sync-followups").disabled = !roleCanReview();
+
+  renderEscalations(data.escalations || []);
+  renderCommunications(data.communications || []);
+  renderFollowups(data.followups || [], data.followup_answers || []);
+  renderSummary(data.summary);
+  renderTimeline(data.summary ? data.summary.timeline : []);
+  renderDiscrepancies(data.discrepancies);
+  renderFacts(data.facts);
+  renderWarnings(data.warnings);
+  renderGaps(data.summary);
+  const note = data.note || (data.summary && data.summary.draft_note);
+  $("note-text").value = note ? note.text : "";
+  $("note-status").textContent = note
+    ? `Status: ${note.status} · version ${note.version} · ${note.approved_by ? "approved by " + note.approved_by : "not approved"}${note.edited_by ? " · edited by " + note.edited_by : ""}`
+    : "No note yet. Run the pipeline to generate an AI draft.";
+  $("approve-note").disabled = !note || note.status === "approved";
+  loadAudit();
+}
+
+function evidenceButton(ref) {
+  const source = escapeHtml(ref.source_id || "");
+  const start = ref.start_char == null ? "" : ref.start_char;
+  const end = ref.end_char == null ? "" : ref.end_char;
+  return `<button class="evidence-link" data-source="${source}" data-start="${start}" data-end="${end}">view source</button>`;
+}
+
+function refsButtons(refs) {
+  if (!refs || !refs.length) return "";
+  const seen = new Set();
+  const buttons = [];
+  refs.forEach((ref) => {
+    const key = `${ref.source_id}:${ref.start_char}:${ref.end_char}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    buttons.push(evidenceButton(ref));
+  });
+  return buttons.join(" ");
+}
+
+function renderSummary(summary) {
+  const container = $("summary");
+  if (!summary) {
+    container.innerHTML = '<p class="hint">No summary yet. Grant consent, add a source, then run the pipeline.</p>';
+    return;
+  }
+  const disclaimers = (summary.disclaimers || []).map((d) => `<li>${escapeHtml(d)}</li>`).join("");
+  let html = `<p class="hint">Generated ${new Date(summary.generated_at).toLocaleString()} · model ${escapeHtml(summary.model || "n/a")} · evidence coverage ${Math.round((summary.evidence_coverage?.evidence_coverage_ratio || 0) * 100)}%</p>`;
+  if (summary.presenting_complaint) {
+    html += `<div class="section"><h3>${escapeHtml(summary.presenting_complaint.title)}</h3>
+      <p>${escapeHtml(summary.presenting_complaint.items.join(" "))}</p>
+      ${refsButtons(summary.presenting_complaint.source_refs)}</div>`;
+  }
+  (summary.sections || []).forEach((section) => {
+    html += `<div class="section">
+      <h3>${escapeHtml(section.title)} <span class="badge">${escapeHtml(section.epistemic_status)}</span></h3>
+      <ul>${(section.items || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+      ${refsButtons(section.source_refs)}
+    </div>`;
+  });
+  html += `<div class="section"><h3>Disclaimers</h3><ul>${disclaimers}</ul></div>`;
+  container.innerHTML = html;
+  container.querySelectorAll("[data-source]").forEach((button) => {
+    button.addEventListener("click", () => openSource(button.dataset.source, button.dataset.start, button.dataset.end));
+  });
+}
+
+function renderTimeline(timeline) {
+  const container = $("timeline");
+  if (!timeline || !timeline.length) {
+    container.innerHTML = '<p class="hint">No normalized timeline entries. Missing time expressions are not invented.</p>';
+    return;
+  }
+  container.innerHTML = timeline.map((entry) => `
+    <div class="timeline-item">
+      <strong>${escapeHtml(entry.label)}</strong>
+      <div class="small-text">Source expression: ${escapeHtml(entry.raw_time || "not stated")}</div>
+      <div class="small-text muted">Normalized: ${escapeHtml(entry.normalized_time || "not normalized")} · certainty: ${escapeHtml(entry.certainty)}
+        ${entry.estimated_start_at ? " · estimated " + escapeHtml(new Date(entry.estimated_start_at).toLocaleString()) : ""}</div>
+      ${entry.progression ? `<div class="small-text">Progression: ${escapeHtml(entry.progression)}</div>` : ""}
+      ${refsButtons(entry.source_refs)}
+    </div>`).join("");
+  container.querySelectorAll("[data-source]").forEach((button) => {
+    button.addEventListener("click", () => openSource(button.dataset.source, button.dataset.start, button.dataset.end));
+  });
+}
+
+function renderDiscrepancies(items) {
+  const container = $("discrepancies");
+  if (!items || !items.length) {
+    container.innerHTML = '<p class="hint">No candidate contradictions detected by the configured checks.</p>';
+    return;
+  }
+  container.innerHTML = items.map((item) => `
+    <div class="discrepancy">
+      <div><span class="badge ${item.severity === "high" ? "EMERGENCY" : "PRIORITY_REVIEW"}">${escapeHtml(item.severity)}</span>
+        <strong>${escapeHtml(item.category)}</strong></div>
+      <p>${escapeHtml(item.summary)}</p>
+      <p class="small-text muted">${escapeHtml(item.explanation)}</p>
+      <div class="small-text">Claims: ${escapeHtml((item.fact_ids || []).join(", ") || "document-level")}</div>
+      ${refsButtons(item.source_refs)}
+    </div>`).join("");
+  container.querySelectorAll("[data-source]").forEach((button) => {
+    button.addEventListener("click", () => openSource(button.dataset.source, button.dataset.start, button.dataset.end));
+  });
+}
+
+function renderFacts(facts) {
+  const container = $("facts");
+  if (!facts || !facts.length) {
+    container.innerHTML = '<p class="hint">No structured facts. The SLM was not asked to treat empty input as a clinical record.</p>';
+    return;
+  }
+  container.innerHTML = facts.map((fact) => {
+    const sourceRefs = fact.source_refs || [];
+    const refHtml = sourceRefs.length
+      ? sourceRefs.map((ref) => evidenceButton(ref)).join(" ")
+      : '<span class="error small-text">No source reference — unverified AI inference</span>';
+    const temporal = fact.temporal && fact.temporal.raw_expression
+      ? `<div class="small-text">Time: ${escapeHtml(fact.temporal.raw_expression)} → ${escapeHtml(fact.temporal.normalized_expression || "not normalized")}</div>`
+      : "";
+    return `
+      <div class="fact">
+        <div class="fact-head">
+          <div><strong>${escapeHtml(fact.label)}</strong>
+            ${fact.value != null ? `<span class="muted">: ${escapeHtml(fact.value)} ${escapeHtml(fact.unit || "")}</span>` : ""}</div>
+          <div>${badge(fact.status)} <span class="badge">${escapeHtml(fact.assertion)}</span>
+            <span class="badge">${escapeHtml(fact.verification_status)}</span></div>
+        </div>
+        <div class="small-text muted">${escapeHtml(fact.fact_type)} · ${escapeHtml(fact.language)} · confidence ${fact.confidence != null ? fact.confidence : "n/a"}
+          ${fact.ai_suggestion ? " · AI inference" : ""}</div>
+        <div class="quote">${escapeHtml(fact.original_text || "(empty quote)")}</div>
+        ${temporal}
+        ${fact.warnings && fact.warnings.length ? `<div class="small-text error">${escapeHtml(fact.warnings.join(", "))}</div>` : ""}
+        <div class="small-text">${refHtml}</div>
+        <div class="actions">
+          <button class="btn secondary small" data-fact="${escapeHtml(fact.fact_id)}" data-action="verify">Verify</button>
+          <button class="btn secondary small" data-fact="${escapeHtml(fact.fact_id)}" data-action="correct">Correct</button>
+          <button class="btn secondary small" data-fact="${escapeHtml(fact.fact_id)}" data-action="dispute">Dispute</button>
+          <button class="btn danger small" data-fact="${escapeHtml(fact.fact_id)}" data-action="reject">Reject</button>
+        </div>
+      </div>`;
+  }).join("");
+  container.querySelectorAll("[data-source]").forEach((button) => {
+    button.addEventListener("click", () => openSource(button.dataset.source, button.dataset.start, button.dataset.end));
+  });
+  container.querySelectorAll("[data-fact]").forEach((button) => {
+    button.addEventListener("click", () => reviewFact(button.dataset.fact, button.dataset.action));
+  });
+}
+
+function renderWarnings(warnings) {
+  const container = $("warnings");
+  if (!warnings || !warnings.length) {
+    container.innerHTML = '<p class="hint">No warnings recorded. Absence of a warning is not clinical clearance.</p>';
+    return;
+  }
+  container.innerHTML = warnings.map((warning) => `
+    <div class="warning ${warning.kind === "rule" ? "" : "component"}">
+      <div><strong>${escapeHtml(warning.label)}</strong>
+        ${warning.outcome ? badge(warning.outcome) : ""}
+        <span class="badge">${escapeHtml(warning.code)}</span></div>
+      <p class="small-text">${escapeHtml(warning.explanation)}</p>
+      ${warning.rule_id ? `<div class="small-text">Rule ${escapeHtml(warning.rule_id)} v${escapeHtml(warning.rule_version || "")} · ${escapeHtml(warning.status)}</div>` : ""}
+      <div class="small-text">Evidence claims: ${escapeHtml((warning.evidence_fact_ids || []).join(", ") || "document-level")}</div>
+      ${refsButtons(warning.source_refs)}
+      ${warning.status === "active" ? `<button class="btn secondary small" data-warning="${escapeHtml(warning.warning_id)}">Acknowledge</button>` : ""}
+    </div>`).join("");
+  container.querySelectorAll("[data-source]").forEach((button) => {
+    button.addEventListener("click", () => openSource(button.dataset.source, button.dataset.start, button.dataset.end));
+  });
+  container.querySelectorAll("[data-warning]").forEach((button) => {
+    button.addEventListener("click", () => acknowledgeWarning(button.dataset.warning));
+  });
+}
+
+function renderGaps(summary) {
+  const gaps = summary ? summary.gaps || [] : [];
+  const questions = summary ? summary.follow_up_questions || [] : [];
+  $("gaps").innerHTML = gaps.length
+    ? `<ul>${gaps.map((gap) => `<li><strong>${escapeHtml(gap.code)}</strong>: ${escapeHtml(gap.description)}</li>`).join("")}</ul>`
+    : '<p class="hint">No missing-information gaps identified by the configured checks.</p>';
+  $("questions").innerHTML = questions.length
+    ? `<h3>Suggested questions</h3><ul>${questions.map((q) => `<li>${escapeHtml(q.text)} <span class="badge">${escapeHtml(q.language)}</span><span class="small-text muted">${escapeHtml(q.rationale)}</span></li>`).join("")}</ul>`
+    : '<p class="hint">No follow-up questions (emergency escalation suppresses non-essential questions).</p>';
+}
+
+function renderEscalations(items) {
+  const panel = $("escalation-panel");
+  const container = $("escalations");
+  if (!items.length) {
+    panel.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+  panel.hidden = false;
+  container.innerHTML = items.map((item) => `
+    <div class="escalation">
+      <div>
+        <div>${badge(item.status)} <span class="badge">${escapeHtml(item.severity)}</span></div>
+        <strong>${escapeHtml(item.trigger_label)}</strong>
+        <div class="small-text muted">${escapeHtml(item.trigger_code)} · created ${escapeHtml(new Date(item.created_at).toLocaleString())}
+          · attempts ${Number(item.attempts || 0)}${item.last_error ? " · " + escapeHtml(item.last_error) : ""}</div>
+      </div>
+      <div class="actions">
+        ${item.status !== "acknowledged" ? `<button class="btn small" data-escalation="${escapeHtml(item.escalation_id)}" data-escalation-action="acknowledge">Acknowledge</button>` : ""}
+        ${["pending", "failed"].includes(item.status) ? `<button class="btn secondary small" data-escalation="${escapeHtml(item.escalation_id)}" data-escalation-action="retry">Retry delivery</button>` : ""}
+      </div>
+    </div>`).join("");
+  container.querySelectorAll("[data-escalation]").forEach((button) => {
+    button.addEventListener("click", () => escalationAction(button.dataset.escalation, button.dataset.escalationAction));
+  });
+}
+
+function renderCommunications(items) {
+  const container = $("communications");
+  if (!items.length) {
+    container.innerHTML = '<p class="hint">No draft or sent patient messages. Use “Draft” to create a curated message for staff approval.</p>';
+    return;
+  }
+  container.innerHTML = items.map((item) => `
+    <article class="message-card ${escapeHtml(item.status)}">
+      <div class="message-head">
+        <div>
+          ${badge(item.status)}
+          <span class="badge">${escapeHtml(item.intent)}</span>
+          <span class="badge">${escapeHtml(item.language)}</span>
+          ${item.approved_by ? `<span class="badge">approved by ${escapeHtml(item.approved_by)}</span>` : ""}
+          ${item.delivery ? `<span class="badge">${escapeHtml(item.delivery)}</span>` : ""}
+        </div>
+        <span class="small-text muted">${escapeHtml(new Date(item.created_at).toLocaleString())}</span>
+      </div>
+      <div class="message-body">${escapeHtml(item.body)}</div>
+      ${item.last_error ? `<div class="error small-text">${escapeHtml(item.last_error)}</div>` : ""}
+      <div class="message-actions">
+        ${["draft", "failed"].includes(item.status) ? `<button class="btn small" data-message="${escapeHtml(item.message_id)}" data-message-action="approve">Review &amp; approve</button>` : ""}
+        ${item.status === "approved" ? `<button class="btn small" data-message="${escapeHtml(item.message_id)}" data-message-action="send">Send</button>` : ""}
+        ${!["sent", "dismissed"].includes(item.status) ? `<button class="btn danger small" data-message="${escapeHtml(item.message_id)}" data-message-action="dismiss">Dismiss</button>` : ""}
+      </div>
+    </article>`).join("");
+  container.querySelectorAll("[data-message]").forEach((button) => {
+    button.addEventListener("click", () => communicationAction(button.dataset.message, button.dataset.messageAction));
+  });
+}
+
+function renderFollowups(items, answers) {
+  const container = $("followups");
+  if (!items.length) {
+    container.innerHTML = '<p class="hint">No follow-up questions yet. Run the pipeline, then sync from the summary.</p>';
+    $("followup-answers").innerHTML = "";
+    return;
+  }
+  container.innerHTML = items.map((item) => `
+    <article class="followup-card">
+      <div class="followup-head">
+        <div>${badge(item.status)} <span class="badge">${escapeHtml(item.language)}</span>
+          ${item.addresses && item.addresses.length ? `<span class="badge">${escapeHtml(item.addresses.join(", "))}</span>` : ""}</div>
+        <span class="small-text muted">${escapeHtml(item.origin || "")}</span>
+      </div>
+      <div class="followup-text">${escapeHtml(item.text)}</div>
+      <div class="small-text muted">${escapeHtml(item.rationale || "")}</div>
+      ${item.last_error ? `<div class="error small-text">${escapeHtml(item.last_error)}</div>` : ""}
+      <div class="followup-actions">
+        ${item.status === "suggested" ? `<button class="btn small" data-followup="${escapeHtml(item.followup_id)}" data-followup-action="approve">Review &amp; approve</button>` : ""}
+        ${item.status === "approved" ? `<button class="btn small" data-followup="${escapeHtml(item.followup_id)}" data-followup-action="send">Send</button>` : ""}
+        ${item.status === "sent" ? `<button class="btn secondary small" data-followup="${escapeHtml(item.followup_id)}" data-followup-action="answer">Record answer</button>` : ""}
+        ${!["answered", "dismissed"].includes(item.status) ? `<button class="btn danger small" data-followup="${escapeHtml(item.followup_id)}" data-followup-action="dismiss">Dismiss</button>` : ""}
+      </div>
+    </article>`).join("");
+  container.querySelectorAll("[data-followup]").forEach((button) => {
+    button.addEventListener("click", () => followupAction(button.dataset.followup, button.dataset.followupAction));
+  });
+  $("followup-answers").innerHTML = answers.length
+    ? `<h3>Recorded answers</h3>${answers.map((answer) => `
+        <div class="answer"><strong>${escapeHtml(answer.answered_by)} (${escapeHtml(answer.role)})</strong>
+          <span class="small-text muted">${escapeHtml(new Date(answer.created_at).toLocaleString())}</span>
+          <div>${escapeHtml(answer.text)}</div>
+        </div>`).join("")}`
+    : "";
+}
+
+async function loadAudit() {
+  const container = $("audit");
+  if (!roleCanReview()) {
+    container.innerHTML = '<p class="hint">Audit trail is available to clinician and admin roles.</p>';
+    return;
+  }
+  container.innerHTML = '<p class="hint">Loading.</p>';
+  try {
+    const data = await api(`/cases/${encodeURIComponent(state.caseId)}/audit`);
+    container.innerHTML = data.items.length
+      ? data.items.map((entry) => `<div>${escapeHtml(new Date(entry.created_at).toLocaleString())} · ${escapeHtml(entry.actor)} (${escapeHtml(entry.role)}) · ${escapeHtml(entry.action)}</div>`).join("")
+      : '<p class="hint">No audit records.</p>';
+  } catch (error) {
+    container.innerHTML = `<p class="hint">Audit requires clinician/admin role. ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+// --------------------------------------------------------------- operations
+async function createCase() {
+  let patientId = state.identity.role === "patient" ? state.identity.patientId : "";
+  if (state.identity.role !== "patient") {
+    patientId = window.prompt("Synthetic patient ID:", "patient_demo");
+    if (!patientId) return;
+  }
+  try {
+    const created = await api("/cases", { method: "POST", body: { patient_id: patientId } });
+    await loadCase(created.case_id);
+  } catch (error) { alert(error.message); }
+}
+
+async function grantConsent() {
+  if (!state.caseId) return;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/consent`, { method: "POST", body: { scope: "careflow_processing_and_review" } });
+    setStatus("Consent granted.");
+    await loadCase(state.caseId);
+  } catch (error) { setStatus(error.message, true); }
+}
+
+async function ingest(kind) {
+  if (!state.caseId) { setStatus("Select a case first.", true); return; }
+  const raw = $("ingest-json").value.trim();
+  if (!raw) { setStatus("Paste STT/OCR JSON or a patient message first.", true); return; }
+  let body;
+  if (kind === "message") {
+    try {
+      body = JSON.parse(raw);
+      if (typeof body === "string") body = { text: body };
+    } catch (_) { body = { text: raw }; }
+  } else {
+    try { body = JSON.parse(raw); } catch (_) { setStatus("Invalid JSON.", true); return; }
+  }
+  const path = kind === "message" ? "message" : kind;
+  try {
+    const result = await api(`/cases/${encodeURIComponent(state.caseId)}/sources/${path}`, { method: "POST", body });
+    setStatus(`Ingested ${result.inserted.length} segment(s); ${result.duplicates.length} duplicate(s) skipped.`);
+    $("ingest-json").value = "";
+    await loadCase(state.caseId);
+  } catch (error) { setStatus(error.message, true); }
+}
+
+async function uploadFile() {
+  if (!state.caseId) { setStatus("Select a case first.", true); return; }
+  const file = $("upload-file").files[0];
+  if (!file) { setStatus("Choose a file first.", true); return; }
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const result = await api(`/cases/${encodeURIComponent(state.caseId)}/uploads`, { method: "POST", body: form });
+    setStatus(result.duplicate ? "Duplicate upload detected; existing document reused." : `Uploaded document ${result.document_id}.`);
+    await loadCase(state.caseId);
+  } catch (error) { setStatus(error.message, true); }
+}
+
+async function processCase() {
+  if (!state.caseId) return;
+  $("process-btn").disabled = true;
+  setStatus("Processing queued. Polling status…");
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/process`, { method: "POST" });
+    let elapsed = 0;
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    state.pollTimer = setInterval(async () => {
+      elapsed += 2;
+      try {
+        const status = await api(`/cases/${encodeURIComponent(state.caseId)}/status`);
+        if (!["queued", "processing", "received", "consent_pending"].includes(status.status)) {
+          clearInterval(state.pollTimer);
+          state.pollTimer = null;
+          $("process-btn").disabled = false;
+          setStatus(`Processing finished: ${status.status} / ${status.workflow_status}.`);
+          await loadCase(state.caseId);
+          await loadQueue();
+          await loadIntelligence();
+        } else if (elapsed > 180) {
+          clearInterval(state.pollTimer);
+          state.pollTimer = null;
+          $("process-btn").disabled = false;
+          setStatus("Processing is taking longer than expected. Check status again shortly.", true);
+        }
+      } catch (error) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+        $("process-btn").disabled = false;
+        setStatus(error.message, true);
+      }
+    }, 2000);
+  } catch (error) {
+    $("process-btn").disabled = false;
+    setStatus(error.message, true);
+  }
+}
+
+async function withdrawConsent() {
+  if (!state.caseId) return;
+  if (!confirm("Withdraw consent and delete source files, facts, summaries and queued data? This cannot be undone.")) return;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/consent/withdraw`, {
+      method: "POST",
+      body: { reason: "withdrawn from UI", delete_data: true },
+    });
+    setStatus("Consent withdrawn and deletion job executed.");
+    state.caseId = null;
+    state.caseData = null;
+    $("case-view").hidden = true;
+    $("welcome").hidden = false;
+    await loadQueue();
+  } catch (error) { setStatus(error.message, true); }
+}
+
+async function reviewFact(factId, action) {
+  if (!state.caseId) return;
+  const body = { action };
+  if (action === "correct") {
+    const value = window.prompt("Corrected value (leave blank to keep current):", "");
+    const note = window.prompt("Correction note (required):", "");
+    if (note) body.note = note;
+    if (value) body.value = value;
+    if (!body.note && !body.value) return;
+  } else if (action === "reject" || action === "dispute" || action === "verify") {
+    const note = window.prompt("Optional review note:", "");
+    if (note) body.note = note;
+  }
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/facts/${encodeURIComponent(factId)}`, { method: "PATCH", body });
+    await loadCase(state.caseId);
+  } catch (error) { alert(error.message); }
+}
+
+async function acknowledgeWarning(warningId) {
+  if (!state.caseId) return;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/warnings/${encodeURIComponent(warningId)}/acknowledge`, { method: "POST" });
+    await loadCase(state.caseId);
+  } catch (error) { alert(error.message); }
+}
+
+async function saveNote() {
+  if (!state.caseId) return;
+  const text = $("note-text").value;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/note`, { method: "PATCH", body: { text } });
+    await loadCase(state.caseId);
+  } catch (error) { alert(error.message); }
+}
+
+async function approveNote() {
+  if (!state.caseId) return;
+  if (!confirm("Approve this note as an authorized clinician? Your identity and timestamp will be recorded.")) return;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/note/approve`, { method: "POST" });
+    await loadCase(state.caseId);
+  } catch (error) { alert(error.message); }
+}
+
+async function overrideStatus() {
+  if (!state.caseId) return;
+  const reason = $("override-reason").value.trim();
+  if (reason.length < 3) { alert("A documented reason is required."); return; }
+  try {
+    if (!confirm("Confirm this workflow status override? The original status, your identity, timestamp and reason will be retained.")) return;
+    await api(`/cases/${encodeURIComponent(state.caseId)}/override`, {
+      method: "POST",
+      body: { final_status: $("override-status").value, reason, confirmed: true },
+    });
+    $("override-reason").value = "";
+    notify("Workflow status overridden with an audit record.");
+    await loadCase(state.caseId);
+    await loadIntelligence();
+  } catch (error) { notify(error.message, true); }
+}
+
+async function assignCase() {
+  if (!state.caseId) return;
+  const reviewer = window.prompt("Assign this case to a clinician (user ID):", state.caseData?.case?.assigned_reviewer || "");
+  if (!reviewer) return;
+  if (!confirm(`Assign or reassign this case to ${reviewer}? This action is audited.`)) return;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/assign`, {
+      method: "POST",
+      body: { reviewer, confirmed: true },
+    });
+    notify(`Case assigned to ${reviewer}.`);
+    await loadCase(state.caseId);
+    await loadIntelligence();
+  } catch (error) { notify(error.message, true); }
+}
+
+async function draftCommunication() {
+  if (!state.caseId) return;
+  const intent = $("communication-intent").value;
+  const language = $("communication-language").value;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/communications/draft`, {
+      method: "POST",
+      body: { intent, language },
+    });
+    notify("Draft created. Review and approve it before sending.");
+    await loadCase(state.caseId);
+  } catch (error) { notify(error.message, true); }
+}
+
+async function communicationAction(messageId, action) {
+  if (!state.caseId) return;
+  const message = (state.caseData?.communications || []).find((item) => item.message_id === messageId);
+  try {
+    if (action === "approve") {
+      const edited = window.prompt("Edit before approval (leave unchanged to keep the curated template):", message ? message.body : "");
+      if (edited === null) return;
+      if (!confirm("Approve this patient message? Your identity and timestamp will be recorded.")) return;
+      const body = { text: message && edited === message.body ? null : edited };
+      await api(`/cases/${encodeURIComponent(state.caseId)}/communications/${encodeURIComponent(messageId)}/approve`, {
+        method: "POST", body,
+      });
+      notify("Message approved. Send it explicitly when ready.");
+    } else if (action === "send") {
+      if (!confirm("Send this approved patient message through the configured outbox?")) return;
+      const result = await api(`/cases/${encodeURIComponent(state.caseId)}/communications/${encodeURIComponent(messageId)}/send`, { method: "POST" });
+      notify(result.status === "sent" ? "Message delivered to the configured outbox." : `Delivery failed: ${result.last_error || "unknown error"}`, result.status !== "sent");
+    } else if (action === "dismiss") {
+      const reason = window.prompt("Reason for dismissing this draft:", "superseded by clinician");
+      if (!reason) return;
+      await api(`/cases/${encodeURIComponent(state.caseId)}/communications/${encodeURIComponent(messageId)}/dismiss`, {
+        method: "POST", body: { reason },
+      });
+      notify("Draft dismissed.");
+    }
+    await loadCase(state.caseId);
+  } catch (error) { notify(error.message, true); }
+}
+
+async function followupAction(followupId, action) {
+  if (!state.caseId) return;
+  const item = (state.caseData?.followups || []).find((entry) => entry.followup_id === followupId);
+  try {
+    if (action === "approve") {
+      const edited = window.prompt("Edit before approval (leave unchanged to keep the question):", item ? item.text : "");
+      if (edited === null) return;
+      const language = window.prompt("Question language (en, hi, or hinglish):", item ? item.language : "en");
+      if (!["en", "hi", "hinglish"].includes(language)) {
+        notify("Choose en, hi, or hinglish. Other variants are not machine-translated.", true);
+        return;
+      }
+      if (!confirm("Approve this follow-up question? Staff approval is recorded.")) return;
+      await api(`/cases/${encodeURIComponent(state.caseId)}/followups/${encodeURIComponent(followupId)}/approve`, {
+        method: "POST",
+        body: { text: item && edited === item.text ? null : edited, language },
+      });
+      notify("Follow-up question approved.");
+    } else if (action === "send") {
+      if (!confirm("Send this approved follow-up question through the configured outbox?")) return;
+      const result = await api(`/cases/${encodeURIComponent(state.caseId)}/followups/${encodeURIComponent(followupId)}/send`, { method: "POST" });
+      notify(result.status === "sent" ? "Follow-up question sent." : `Send failed: ${result.last_error || "unknown error"}`, result.status !== "sent");
+    } else if (action === "answer") {
+      const text = window.prompt("Record the patient's answer in their own words:");
+      if (!text) return;
+      const result = await api(`/cases/${encodeURIComponent(state.caseId)}/followups/${encodeURIComponent(followupId)}/answers`, {
+        method: "POST",
+        body: { text, language: item ? item.language : "en", reprocess: true },
+      });
+      notify(`Answer stored as a new source. Processing: ${result.processing}.`);
+      await loadCase(state.caseId);
+      await loadQueue();
+      await loadIntelligence();
+      return;
+    } else if (action === "dismiss") {
+      const reason = window.prompt("Reason for dismissing this follow-up:", "not needed after clinician review");
+      if (!reason) return;
+      await api(`/cases/${encodeURIComponent(state.caseId)}/followups/${encodeURIComponent(followupId)}/dismiss`, {
+        method: "POST", body: { reason },
+      });
+      notify("Follow-up dismissed.");
+    }
+    await loadCase(state.caseId);
+  } catch (error) { notify(error.message, true); }
+}
+
+async function escalationAction(escalationId, action) {
+  try {
+    if (action === "acknowledge") {
+      const note = window.prompt("Optional acknowledgement note:", "");
+      if (note === null) return;
+      await api(`/escalations/${encodeURIComponent(escalationId)}/acknowledge`, {
+        method: "POST", body: { note: note || null },
+      });
+      notify("Emergency escalation acknowledged.");
+    } else if (action === "retry") {
+      const result = await api(`/escalations/${encodeURIComponent(escalationId)}/retry`, { method: "POST" });
+      notify(result.status === "sent" ? "Escalation delivery retried successfully." : `Retry failed: ${result.last_error || "unknown error"}`, result.status !== "sent");
+    }
+    if (state.caseId) await loadCase(state.caseId);
+    await loadIntelligence();
+  } catch (error) { notify(error.message, true); }
+}
+
+async function syncFollowups() {
+  if (!state.caseId) return;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/followups/sync`, { method: "POST" });
+    notify("Follow-up questions synced from the current summary.");
+    await loadCase(state.caseId);
+  } catch (error) { notify(error.message, true); }
+}
+
+// ---------------------------------------------------------------- evidence
+async function openSource(sourceId, start, end) {
+  if (!sourceId) return;
+  try {
+    const source = await api(`/cases/${encodeURIComponent(state.caseId)}/sources/${encodeURIComponent(sourceId)}`);
+    const text = source.original_text || "";
+    const from = start === "" || start == null ? null : Number(start);
+    const to = end === "" || end == null ? null : Number(end);
+    let body;
+    if (from != null && to != null && from >= 0 && to <= text.length && to > from) {
+      body = `${escapeHtml(text.slice(0, from))}<mark>${escapeHtml(text.slice(from, to))}</mark>${escapeHtml(text.slice(to))}`;
+    } else {
+      body = escapeHtml(text);
+    }
+    $("modal-title").textContent = `Source evidence — ${source.modality}`;
+    $("modal-body").innerHTML = `
+      <p class="small-text muted">
+        source_id: ${escapeHtml(source.source_id)} · segment: ${escapeHtml(source.segment_id)} ·
+        language: ${escapeHtml(source.language)} (${escapeHtml(source.language_status)}) ·
+        confidence: ${source.confidence != null ? source.confidence : "not provided"}<br>
+        ${source.document_ref ? "document: " + escapeHtml(source.document_ref) + " · " : ""}
+        ${source.page != null ? "page: " + source.page + " · " : ""}
+        ${source.bbox ? "bbox: [" + source.bbox.join(", ") + "] · " : ""}
+        ${source.audio_start != null ? "audio: " + source.audio_start + "s–" + (source.audio_end != null ? source.audio_end : "?") + "s · " : ""}
+        ${source.warnings && source.warnings.length ? "warnings: " + escapeHtml(source.warnings.join(", ")) : ""}
+      </p>
+      <div class="evidence-text">${body}</div>`;
+    $("modal").hidden = false;
+  } catch (error) { alert(error.message); }
+}
+
+// ------------------------------------------------------------------- wiring
+function wire() {
+  $("save-identity").addEventListener("click", saveIdentity);
+  $("refresh-queue").addEventListener("click", loadQueue);
+  $("refresh-intel").addEventListener("click", loadIntelligence);
+  $("new-case").addEventListener("click", createCase);
+  $("refresh-case").addEventListener("click", () => { if (state.caseId) loadCase(state.caseId); });
+  $("assign-btn").addEventListener("click", assignCase);
+  $("consent-btn").addEventListener("click", grantConsent);
+  $("process-btn").addEventListener("click", processCase);
+  $("withdraw-btn").addEventListener("click", withdrawConsent);
+  $("upload-btn").addEventListener("click", uploadFile);
+  $("save-staffing").addEventListener("click", saveStaffing);
+  $("draft-message").addEventListener("click", draftCommunication);
+  $("sync-followups").addEventListener("click", syncFollowups);
+  $("save-note").addEventListener("click", saveNote);
+  $("approve-note").addEventListener("click", approveNote);
+  $("override-btn").addEventListener("click", overrideStatus);
+  $("modal-close").addEventListener("click", () => { $("modal").hidden = true; });
+  $("modal").addEventListener("click", (event) => {
+    if (event.target === $("modal")) $("modal").hidden = true;
+  });
+  document.querySelectorAll("[data-ingest]").forEach((button) => {
+    button.addEventListener("click", () => ingest(button.dataset.ingest));
+  });
+  $("role").addEventListener("change", () => {
+    $("patient-id").style.display = $("role").value === "patient" ? "" : "none";
+  });
+}
+
+loadIdentity();
+wire();
+$("patient-id").style.display = state.identity.role === "patient" ? "" : "none";
+loadQueue();
+loadIntelligence();
