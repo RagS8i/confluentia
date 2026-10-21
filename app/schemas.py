@@ -450,6 +450,14 @@ class CaseRecord(BaseModel):
     language_hint: Optional[str] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def consent_granted(self) -> bool:
+        return self.consent_granted_at is not None and self.consent_withdrawn_at is None
+
+    @property
+    def deleted(self) -> bool:
+        return self.deleted_at is not None
+
 
 class ProcessingRun(BaseModel):
     model_config = ConfigDict(extra="forbid")

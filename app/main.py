@@ -9,7 +9,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -24,6 +36,7 @@ from .db import Database
 from .deletion import DeletionService
 from .escalation import EscalationError, EscalationService
 from .followups import FollowUpError, FollowUpService
+from .intake import IntakeService, OcrClient, SttClient, persist_sources
 from .model.provider import BaseProvider, build_provider
 from .pipeline.normalize import InputError, adapt_ocr, adapt_stt, adapt_typed
 from .pipeline.orchestrator import (
@@ -192,6 +205,10 @@ def _queue_ops(request: Request) -> QueueOperationsService:
     return request.app.state.queue_ops
 
 
+def _intake(request: Request) -> IntakeService:
+    return request.app.state.intake
+
+
 def _raise_service_error(exc: Exception):
     if isinstance(exc, (CommunicationError, FollowUpError, EscalationError)):
         raise HTTPException(
@@ -250,33 +267,20 @@ def _source_public(source, include_text: bool = False) -> Dict[str, Any]:
 
 def _ingest(request: Request, case: CaseRecord, sources, notes, principal: Principal, kind: str):
     _require_consent(case)
-    db, cipher = _db(request), _cipher(request)
-    inserted, duplicates = [], []
-    for source in sources:
-        if db.upsert_source(source, cipher):
-            inserted.append(source.source_id)
-        else:
-            duplicates.append(source.source_id)
-    case = db.get_case(case.case_id, include_deleted=True)
-    if case is not None and case.status in (CaseStatus.received, CaseStatus.consent_pending):
-        case.status = CaseStatus.queued
-        db.save_case(case)
-    db.audit(
-        principal.user_id,
-        principal.role,
-        f"{kind}_ingested",
-        case.case_id,
-        {
-            "inserted": len(inserted),
-            "duplicates": len(duplicates),
-            "notes": notes,
-            "modalities": sorted({s.modality.value for s in sources}),
-        },
+    res = persist_sources(
+        db=_db(request),
+        cipher=_cipher(request),
+        case=case,
+        sources=sources,
+        notes=notes,
+        user_id=principal.user_id,
+        role=principal.role,
+        kind=kind,
     )
     return {
         "case_id": case.case_id,
-        "inserted": inserted,
-        "duplicates": duplicates,
+        "inserted": res["inserted"],
+        "duplicates": res["duplicates"],
         "notes": notes,
         "sources": [_source_public(s) for s in sources],
     }
@@ -541,7 +545,7 @@ def grant_consent(
     request: Request,
     principal: Principal = Depends(current_principal),
 ):
-    ensure_roles(principal, {"patient", "intake", "admin"})
+    ensure_roles(principal, {"patient", "intake", "clinician", "admin"})
     case = _load_case(request, case_id, principal)
     if case.deleted_at is not None:
         raise HTTPException(status_code=410, detail="case has been deleted")
@@ -744,6 +748,7 @@ def download_document(
     document_id: str,
     request: Request,
     principal: Principal = Depends(current_principal),
+    inline: bool = Query(default=False),
 ):
     db = _db(request)
     document = db.get_document(document_id)
@@ -758,11 +763,219 @@ def download_document(
         case.case_id,
         {"document_id": document_id},
     )
+    disposition = (
+        "inline"
+        if inline
+        or document["mime"].startswith("audio/")
+        or document["mime"].startswith("image/")
+        or document["mime"] == "application/pdf"
+        else "attachment"
+    )
     return Response(
         content=content,
         media_type=document["mime"],
-        headers={"Content-Disposition": f'attachment; filename="{document["original_name"]}"'},
+        headers={"Content-Disposition": f'{disposition}; filename="{document["original_name"]}"'},
     )
+
+
+# ----------------------------------------------------------- direct intake API
+ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".aac"}
+ALLOWED_AUDIO_MIMES = {
+    "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3",
+    "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/ogg", "audio/vorbis",
+    "audio/flac", "audio/x-flac", "audio/webm", "audio/aac", "application/octet-stream"
+}
+
+ALLOWED_DOC_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif"}
+ALLOWED_DOC_MIMES = {
+    "application/pdf", "image/png", "image/jpeg", "image/webp", "image/tiff"
+}
+
+
+@router.post("/cases/{case_id}/intake/audio", status_code=202)
+async def intake_audio(
+    case_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    auto_process: bool = Query(default=True),
+    target_language: str = Query(default="en-IN"),
+    principal: Principal = Depends(current_principal),
+):
+    ensure_roles(principal, {"patient", "intake", "clinician", "admin"})
+    case = _load_case(request, case_id, principal)
+    _require_consent(case)
+
+    settings = _settings(request)
+    filename = file.filename or "audio.wav"
+    ext = Path(filename).suffix.lower()
+    raw_mime = (file.content_type or "audio/wav").split(";")[0].strip().lower()
+
+    if raw_mime not in ALLOWED_AUDIO_MIMES and not raw_mime.startswith("audio/"):
+        if ext not in ALLOWED_AUDIO_EXTENSIONS:
+            raise HTTPException(status_code=415, detail="unsupported audio content type")
+    if ext and ext not in ALLOWED_AUDIO_EXTENSIONS and not raw_mime.startswith("audio/"):
+        raise HTTPException(status_code=415, detail="unsupported audio file extension")
+
+    content = await file.read(settings.max_upload_bytes + 1)
+    if len(content) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="upload exceeds configured size limit")
+    if not content:
+        raise HTTPException(status_code=422, detail="empty upload")
+
+    # Save encrypted original through DocumentStore
+    stored = _documents(request).save(case_id, filename, content)
+    document_id = random_id("doc")
+    _db(request).add_document(
+        document_id,
+        case_id,
+        stored["stored_name"],
+        stored["original_name"],
+        raw_mime if raw_mime.startswith("audio/") else "audio/wav",
+        stored["size"],
+        stored["sha256"],
+    )
+    _db(request).audit(
+        principal.user_id,
+        principal.role,
+        "audio_uploaded",
+        case_id,
+        {"document_id": document_id, "mime": raw_mime, "size": stored["size"]},
+    )
+
+    # Create intake job
+    job = _intake(request).create_job(
+        case_id=case_id,
+        document_id=document_id,
+        kind="audio",
+        filename=stored["original_name"],
+        auto_process=auto_process,
+        target_language=target_language,
+    )
+
+    # Launch background processing task
+    background_tasks.add_task(
+        _intake(request).process_audio_job,
+        job_id=job.job_id,
+        audio_bytes=content,
+        user_id=principal.user_id,
+        role=principal.role,
+    )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job.job_id,
+            "case_id": case_id,
+            "document_id": document_id,
+            "kind": job.kind,
+            "stage": job.stage,
+            "status": job.status,
+            "poll": f"/api/cases/{case_id}/intake/jobs/{job.job_id}",
+        },
+    )
+
+
+@router.post("/cases/{case_id}/intake/document", status_code=202)
+async def intake_document(
+    case_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    auto_process: bool = Query(default=True),
+    principal: Principal = Depends(current_principal),
+):
+    ensure_roles(principal, {"patient", "intake", "clinician", "admin"})
+    case = _load_case(request, case_id, principal)
+    _require_consent(case)
+
+    settings = _settings(request)
+    filename = file.filename or "document.pdf"
+    ext = Path(filename).suffix.lower()
+    raw_mime = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
+
+    if raw_mime not in ALLOWED_DOC_MIMES and ext not in ALLOWED_DOC_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="unsupported document content type")
+    if ext and ext not in ALLOWED_DOC_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="unsupported document file extension")
+
+    content = await file.read(settings.max_upload_bytes + 1)
+    if len(content) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="upload exceeds configured size limit")
+    if not content:
+        raise HTTPException(status_code=422, detail="empty upload")
+
+    # Determine stored mime
+    inferred_mime = mimetypes.guess_type(filename)[0] or raw_mime
+    if inferred_mime not in ALLOWED_DOC_MIMES:
+        inferred_mime = "application/pdf" if ext == ".pdf" else "image/png"
+
+    # Save encrypted original through DocumentStore
+    stored = _documents(request).save(case_id, filename, content)
+    document_id = random_id("doc")
+    _db(request).add_document(
+        document_id,
+        case_id,
+        stored["stored_name"],
+        stored["original_name"],
+        inferred_mime,
+        stored["size"],
+        stored["sha256"],
+    )
+    _db(request).audit(
+        principal.user_id,
+        principal.role,
+        "document_uploaded",
+        case_id,
+        {"document_id": document_id, "mime": inferred_mime, "size": stored["size"]},
+    )
+
+    # Create intake job
+    job = _intake(request).create_job(
+        case_id=case_id,
+        document_id=document_id,
+        kind="document",
+        filename=stored["original_name"],
+        auto_process=auto_process,
+    )
+
+    # Launch background processing task
+    background_tasks.add_task(
+        _intake(request).process_document_job,
+        job_id=job.job_id,
+        document_bytes=content,
+        user_id=principal.user_id,
+        role=principal.role,
+    )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job.job_id,
+            "case_id": case_id,
+            "document_id": document_id,
+            "kind": job.kind,
+            "stage": job.stage,
+            "status": job.status,
+            "poll": f"/api/cases/{case_id}/intake/jobs/{job.job_id}",
+        },
+    )
+
+
+@router.get("/cases/{case_id}/intake/jobs/{job_id}")
+def get_intake_job(
+    case_id: str,
+    job_id: str,
+    request: Request,
+    principal: Principal = Depends(current_principal),
+):
+    ensure_roles(principal, {"patient", "intake", "clinician", "admin"})
+    _load_case(request, case_id, principal)
+    job = _intake(request).get_job(job_id)
+    if job is None or job.case_id != case_id:
+        raise HTTPException(status_code=404, detail="intake job not found")
+    return job.to_dict()
+
 
 
 @router.post("/cases/{case_id}/process")
@@ -1439,6 +1652,8 @@ def create_app(
     settings: Optional[Settings] = None,
     provider: Optional[BaseProvider] = None,
     engine: Optional[RuleEngine] = None,
+    stt_client: Optional[SttClient] = None,
+    ocr_client: Optional[OcrClient] = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     cipher = Cipher(settings)
@@ -1462,6 +1677,15 @@ def create_app(
     )
     followups.pipeline = pipeline
     deletion = DeletionService(db, documents)
+    intake = IntakeService(
+        settings=settings,
+        db=db,
+        cipher=cipher,
+        documents=documents,
+        pipeline=pipeline,
+        stt_client=stt_client,
+        ocr_client=ocr_client,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -1477,6 +1701,13 @@ def create_app(
         ),
         lifespan=lifespan,
     )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.state.settings = settings
     app.state.db = db
     app.state.cipher = cipher
@@ -1489,6 +1720,7 @@ def create_app(
     app.state.escalations = escalations
     app.state.followups = followups
     app.state.communications = communications
+    app.state.intake = intake
 
     app.include_router(router)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

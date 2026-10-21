@@ -215,3 +215,111 @@ def test_adapters_reject_payloads_with_no_usable_text():
             case_id="case_empty_ocr",
         )
     assert ocr_error.value.code == "empty_document"
+
+
+def test_adapt_stt_preserves_original_hindi_and_hinglish_provenance():
+    """Regression test: Hindi/Hinglish transcription survives in original_text, not replaced by translation."""
+    hindi_payload = {
+        "transcription": "मुझे दो दिन से चक्कर आ रहे हैं और बहुत कमजोरी लग रही है",
+        "translated_text": "I have been feeling dizzy and very weak for two days",
+        "target_language": "en-IN",
+        "document_id": "doc_hindi_audio_001",
+        "chunks": [
+            {
+                "index": 0,
+                "start_seconds": 1.0,
+                "end_seconds": 4.5,
+                "transcription": "मुझे दो दिन से चक्कर आ रहे हैं और बहुत कमजोरी लग रही है",
+                "translated_text": "I have been feeling dizzy and very weak for two days",
+                "language_code": "hi",
+                "language_probability": 0.98,
+            }
+        ],
+    }
+
+    records, notes = adapt_stt(hindi_payload, case_id="case_hindi_001")
+    assert not notes
+    assert len(records) == 1
+    rec = records[0]
+    # PROVENANCE CHECK: original_text MUST be the Hindi transcription!
+    assert "मुझे दो दिन से चक्कर आ रहे हैं" in rec.original_text
+    assert "feeling dizzy" not in rec.original_text
+    # English translation preserved in raw_metadata
+    assert rec.raw_metadata.get("translated_text") == "I have been feeling dizzy and very weak for two days"
+    assert rec.document_ref == "doc_hindi_audio_001"
+    assert rec.audio_start == 1.0
+    assert rec.audio_end == 4.5
+    assert rec.language == "hi"
+
+    # Hinglish provenance test
+    hinglish_payload = {
+        "transcription": "Mujhe two days se sudden chest pain ho raha hai after walking",
+        "translated_text": "I have sudden chest pain for two days after walking",
+        "target_language": "en-IN",
+        "document_id": "doc_hinglish_001",
+        "chunks": [
+            {
+                "index": 0,
+                "start_seconds": 0.0,
+                "end_seconds": 3.8,
+                "transcription": "Mujhe two days se sudden chest pain ho raha hai after walking",
+                "translated_text": "I have sudden chest pain for two days after walking",
+                "language_code": "hinglish",
+                "language_probability": 0.92,
+            }
+        ],
+    }
+    records, notes = adapt_stt(hinglish_payload, case_id="case_hinglish_001")
+    assert len(records) == 1
+    h_rec = records[0]
+    assert "Mujhe two days se sudden chest pain" in h_rec.original_text
+    assert h_rec.document_ref == "doc_hinglish_001"
+    assert h_rec.language == "hinglish"
+
+
+def test_adapt_ocr_with_paddle_model_output():
+    """Verify adapt_ocr extracts structured blocks and bboxes directly from Paddle model_output."""
+    payload = {
+        "document_id": "doc_lab_002",
+        "file_name": "patient_lab_report.pdf",
+        "page_count": 1,
+        "pages": [
+            {
+                "page_number": 1,
+                "model_output": {
+                    "res": {
+                        "parsing_res_list": [
+                            {
+                                "block_label": "text",
+                                "block_content": "Fasting Blood Sugar: 145 mg/dL",
+                                "block_order": 1,
+                                "bbox": [15.0, 25.0, 190.0, 45.0],
+                                "confidence": 0.99,
+                            },
+                            {
+                                "block_label": "text",
+                                "block_content": "HbA1c: 7.8 % (High)",
+                                "block_order": 2,
+                                "block_bbox": [15.0, 55.0, 160.0, 75.0],
+                                "confidence": 0.98,
+                            },
+                        ]
+                    }
+                },
+            }
+        ],
+    }
+
+    records, notes = adapt_ocr(payload, case_id="case_paddle_001")
+    assert not notes
+    assert len(records) == 2
+    r0 = records[0]
+    assert r0.document_ref == "doc_lab_002"
+    assert "Fasting Blood Sugar: 145 mg/dL" in r0.original_text
+    assert r0.bbox == [15.0, 25.0, 190.0, 45.0]
+    assert r0.page == 1
+
+    r1 = records[1]
+    assert "HbA1c: 7.8 %" in r1.original_text
+    assert r1.bbox == [15.0, 55.0, 160.0, 75.0]
+

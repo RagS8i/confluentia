@@ -35,15 +35,20 @@ class TranscriptChunk(BaseModel):
     index: int = Field(ge=0)
     start_seconds: float = Field(ge=0)
     end_seconds: float = Field(ge=0)
+    transcription: str | None = None
     translated_text: str
     language_code: str | None = None
     language_probability: float | None = Field(default=None, ge=0, le=1)
+    speech_to_text_request_id: str | None = None
+    translation_request_id: str | None = None
     request_id: str | None = None
 
 
 class SpeechTranslationResult(BaseModel):
     """Strict output contract for the STT worker."""
 
+    transcription: str | None = None
     translated_text: str
     target_language: str
     chunks: list[TranscriptChunk]
+    document_id: str | None = None

@@ -184,7 +184,7 @@ def speech_to_language(
                 stt_response = get_sarvam_client().speech_to_text.transcribe(
                     file=audio_file,
                     model=STT_MODEL,
-                    mode="translate",
+                    mode="codemix",
                     language_code=STT_LANGUAGE,
                 )
 

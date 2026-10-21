@@ -7,6 +7,12 @@ const state = {
   intelligence: null,
   pollTimer: null,
   toastTimer: null,
+  mediaRecorder: null,
+  recordedChunks: [],
+  recordedAudioBlob: null,
+  recordTimerInterval: null,
+  recordSeconds: 0,
+  intakeJobTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -234,8 +240,15 @@ async function saveStaffing() {
 }
 
 // -------------------------------------------------------------------- case
-async function loadCase(caseId) {
+async function loadCase(caseId, updateUrl = true) {
   state.caseId = caseId;
+  if (updateUrl && window.history && window.history.replaceState) {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("case_id", caseId);
+      window.history.replaceState({}, "", url.toString());
+    } catch (_) {}
+  }
   try {
     const data = await api(`/cases/${encodeURIComponent(caseId)}`);
     state.caseData = data;
@@ -245,6 +258,20 @@ async function loadCase(caseId) {
     loadQueue();
   } catch (error) {
     alert(error.message);
+  }
+}
+
+function copyCaseLink() {
+  if (!state.caseId) return;
+  const url = `${window.location.origin}${window.location.pathname}?case_id=${encodeURIComponent(state.caseId)}`;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(() => {
+      notify(`Direct case link copied to clipboard: ${url}`);
+    }).catch(() => {
+      prompt("Direct case link:", url);
+    });
+  } else {
+    prompt("Direct case link:", url);
   }
 }
 
@@ -286,6 +313,7 @@ function renderCase(data) {
   renderSummary(data.summary);
   renderTimeline(data.summary ? data.summary.timeline : []);
   renderDiscrepancies(data.discrepancies);
+  renderSources(data.sources || []);
   renderFacts(data.facts);
   renderWarnings(data.warnings);
   renderGaps(data.summary);
@@ -296,6 +324,7 @@ function renderCase(data) {
     : "No note yet. Run the pipeline to generate an AI draft.";
   $("approve-note").disabled = !note || note.status === "approved";
   loadAudit();
+  updateIntakeGate();
 }
 
 function evidenceButton(ref) {
@@ -382,6 +411,47 @@ function renderDiscrepancies(items) {
     </div>`).join("");
   container.querySelectorAll("[data-source]").forEach((button) => {
     button.addEventListener("click", () => openSource(button.dataset.source, button.dataset.start, button.dataset.end));
+  });
+}
+
+function renderSources(sources) {
+  const container = $("sources-list");
+  if (!container) return;
+  const countSpan = $("sources-count");
+  if (countSpan) countSpan.textContent = sources && sources.length ? `(${sources.length})` : "";
+  if (!sources || !sources.length) {
+    container.innerHTML = '<p class="hint">No sources ingested yet. Record audio, upload a medical report, or send a message on the intake panel to begin.</p>';
+    return;
+  }
+  container.innerHTML = sources.map((source) => {
+    const modalityBadge = badge(source.modality.toUpperCase());
+    const langBadge = `<span class="badge">${escapeHtml(source.language || "unknown")}</span>`;
+    const docLink = source.document_ref
+      ? `<a href="/api/documents/${encodeURIComponent(source.document_ref)}?inline=true" target="_blank" rel="noopener" class="small-text" style="margin-left: 0.5rem; text-decoration: underline;">View Raw File ↗</a>`
+      : "";
+    const timing = source.audio_start != null
+      ? `<span class="small-text muted"> · ${source.audio_start}s–${source.audio_end != null ? source.audio_end : "?"}s</span>`
+      : (source.page != null ? `<span class="small-text muted"> · Page ${source.page}</span>` : "");
+    const excerpt = source.original_text || "(empty transcript or text)";
+
+    return `
+      <div class="fact" style="margin-bottom: 0.65rem;">
+        <div class="fact-head">
+          <div>
+            ${modalityBadge} ${langBadge} ${timing}
+          </div>
+          <div>
+            ${docLink}
+            <button class="btn secondary small" data-source-preview="${escapeHtml(source.source_id)}" style="margin-left: 0.4rem;">Inspect Source</button>
+          </div>
+        </div>
+        <div class="quote" style="margin-top: 0.4rem;">${escapeHtml(excerpt)}</div>
+      </div>
+    `;
+  }).join("");
+
+  container.querySelectorAll("[data-source-preview]").forEach((button) => {
+    button.addEventListener("click", () => openSource(button.dataset.sourcePreview));
   });
 }
 
@@ -598,6 +668,271 @@ async function grantConsent() {
   } catch (error) { setStatus(error.message, true); }
 }
 
+// ------------------------------------------------------------------- intake
+function switchIntakeTab(tabName) {
+  document.querySelectorAll(".intake-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === tabName);
+  });
+  $("tab-audio").hidden = tabName !== "audio";
+  $("tab-document").hidden = tabName !== "document";
+  $("tab-message").hidden = tabName !== "message";
+}
+
+function updateIntakeGate() {
+  const c = state.caseData?.case;
+  const hasConsent = Boolean(state.caseId && c && c.consent_granted_at && !c.consent_withdrawn_at && !c.deleted_at);
+  const gate = $("intake-gate");
+  if (gate) gate.hidden = hasConsent;
+  const buttons = [
+    $("record-btn"),
+    $("submit-audio-btn"),
+    $("submit-doc-btn"),
+    $("submit-message-btn"),
+    $("upload-btn"),
+  ];
+  buttons.forEach((btn) => {
+    if (btn) btn.disabled = !hasConsent;
+  });
+}
+
+async function toggleRecording() {
+  if (state.mediaRecorder && state.mediaRecorder.state === "recording") {
+    stopRecording();
+  } else {
+    await startRecording();
+  }
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    notify("Audio recording is not supported in this browser.", true);
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.recordedChunks = [];
+    state.mediaRecorder = new MediaRecorder(stream);
+    state.mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) state.recordedChunks.push(e.data);
+    };
+    state.mediaRecorder.onstop = () => {
+      const mimeType = state.mediaRecorder.mimeType || "audio/webm";
+      state.recordedAudioBlob = new Blob(state.recordedChunks, { type: mimeType });
+      const preview = $("record-preview");
+      if (preview) {
+        preview.src = URL.createObjectURL(state.recordedAudioBlob);
+        preview.hidden = false;
+      }
+      stream.getTracks().forEach((track) => track.stop());
+      $("record-btn").textContent = "● Record";
+      $("stop-record-btn").disabled = true;
+      clearInterval(state.recordTimerInterval);
+      state.recordTimerInterval = null;
+      $("record-timer").hidden = true;
+    };
+    state.mediaRecorder.start();
+    $("record-btn").textContent = "Recording...";
+    $("stop-record-btn").disabled = false;
+    state.recordSeconds = 0;
+    $("record-timer").textContent = "00:00";
+    $("record-timer").hidden = false;
+    state.recordTimerInterval = setInterval(() => {
+      state.recordSeconds++;
+      const mins = String(Math.floor(state.recordSeconds / 60)).padStart(2, "0");
+      const secs = String(state.recordSeconds % 60).padStart(2, "0");
+      $("record-timer").textContent = `${mins}:${secs}`;
+    }, 1000);
+  } catch (err) {
+    notify(`Could not access microphone: ${err.message}`, true);
+  }
+}
+
+function stopRecording() {
+  if (state.mediaRecorder && state.mediaRecorder.state === "recording") {
+    state.mediaRecorder.stop();
+  }
+}
+
+async function submitAudioIntake() {
+  if (!state.caseId) { notify("Select a case first.", true); return; }
+  let audioFile = null;
+  const fileInput = $("audio-file");
+  if (fileInput && fileInput.files && fileInput.files[0]) {
+    audioFile = fileInput.files[0];
+  } else if (state.recordedAudioBlob) {
+    const ext = state.recordedAudioBlob.type.includes("wav") ? "wav" : (state.recordedAudioBlob.type.includes("ogg") ? "ogg" : "webm");
+    audioFile = new File([state.recordedAudioBlob], `recorded_intake.${ext}`, { type: state.recordedAudioBlob.type });
+  }
+  if (!audioFile) {
+    notify("Please record audio or select an audio file first.", true);
+    return;
+  }
+
+  const autoProcess = $("audio-auto-process") ? $("audio-auto-process").checked : true;
+  const targetLang = $("audio-target-lang") ? $("audio-target-lang").value : "en-IN";
+
+  const form = new FormData();
+  form.append("file", audioFile);
+
+  $("submit-audio-btn").disabled = true;
+  try {
+    const res = await api(`/cases/${encodeURIComponent(state.caseId)}/intake/audio?auto_process=${autoProcess}&target_language=${encodeURIComponent(targetLang)}`, {
+      method: "POST",
+      body: form,
+    });
+    notify(`Audio uploaded. Starting transcription job ${res.job_id}...`);
+    if (fileInput) fileInput.value = "";
+    state.recordedAudioBlob = null;
+    const preview = $("record-preview");
+    if (preview) { preview.src = ""; preview.hidden = true; }
+    startIntakeJobPolling(res.job_id, "audio", autoProcess);
+  } catch (err) {
+    notify(err.message, true);
+    $("submit-audio-btn").disabled = false;
+  }
+}
+
+async function submitDocumentIntake() {
+  if (!state.caseId) { notify("Select a case first.", true); return; }
+  const fileInput = $("doc-file");
+  const docFile = fileInput && fileInput.files ? fileInput.files[0] : null;
+  if (!docFile) {
+    notify("Please select a document or image file first.", true);
+    return;
+  }
+
+  const autoProcess = $("doc-auto-process") ? $("doc-auto-process").checked : true;
+  const form = new FormData();
+  form.append("file", docFile);
+
+  $("submit-doc-btn").disabled = true;
+  try {
+    const res = await api(`/cases/${encodeURIComponent(state.caseId)}/intake/document?auto_process=${autoProcess}`, {
+      method: "POST",
+      body: form,
+    });
+    notify(`Document uploaded. Starting OCR job ${res.job_id}...`);
+    if (fileInput) fileInput.value = "";
+    startIntakeJobPolling(res.job_id, "document", autoProcess);
+  } catch (err) {
+    notify(err.message, true);
+    $("submit-doc-btn").disabled = false;
+  }
+}
+
+async function submitMessageIntake() {
+  if (!state.caseId) { notify("Select a case first.", true); return; }
+  const text = $("typed-message-text").value.trim();
+  if (!text) { notify("Please enter a patient message first.", true); return; }
+  const language = $("typed-message-lang").value;
+
+  $("submit-message-btn").disabled = true;
+  try {
+    const res = await api(`/cases/${encodeURIComponent(state.caseId)}/sources/message`, {
+      method: "POST",
+      body: { text, language },
+    });
+    notify(`Message ingested (${res.inserted.length} source created).`);
+    $("typed-message-text").value = "";
+    await loadCase(state.caseId);
+    await loadQueue();
+    await loadIntelligence();
+  } catch (err) {
+    notify(err.message, true);
+  } finally {
+    $("submit-message-btn").disabled = false;
+  }
+}
+
+function startIntakeJobPolling(jobId, kind, autoProcess) {
+  const panel = $("intake-job-panel");
+  const stageEl = $("intake-job-stage");
+  const timerEl = $("intake-job-timer");
+  const msgEl = $("intake-job-msg");
+  const cpuWarning = $("intake-cpu-warning");
+
+  if (panel) panel.hidden = false;
+  if (cpuWarning) cpuWarning.hidden = (kind !== "document");
+
+  let elapsed = 0;
+  if (state.intakeJobTimer) clearInterval(state.intakeJobTimer);
+
+  state.intakeJobTimer = setInterval(async () => {
+    elapsed += 1.5;
+    if (timerEl) timerEl.textContent = `${Math.round(elapsed)}s`;
+
+    try {
+      const job = await api(`/cases/${encodeURIComponent(state.caseId)}/intake/jobs/${encodeURIComponent(jobId)}`);
+      if (stageEl) {
+        stageEl.textContent = job.stage;
+        stageEl.className = `badge ${job.status === "failed" ? "EMERGENCY" : (job.status === "complete" ? "ROUTINE_REVIEW" : "PRIORITY_REVIEW")}`;
+      }
+      if (msgEl) {
+        if (job.stage === "transcribing") msgEl.textContent = "Transcribing audio via Sarvam STT...";
+        else if (job.stage === "reading") msgEl.textContent = "Reading layout and text via PaddleOCR...";
+        else if (job.stage === "ingesting") msgEl.textContent = "Persisting normalized sources and metadata...";
+        else if (job.stage === "processing") msgEl.textContent = "Submitting case to clinical pipeline...";
+        else if (job.status === "complete") msgEl.textContent = `Completed! ${job.result?.inserted || 0} source(s) inserted.`;
+        else if (job.status === "failed") msgEl.textContent = `Error: ${job.error || "Intake processing failed."}`;
+      }
+
+      if (job.status === "complete") {
+        clearInterval(state.intakeJobTimer);
+        state.intakeJobTimer = null;
+        if (cpuWarning) cpuWarning.hidden = true;
+        $("submit-audio-btn").disabled = false;
+        $("submit-doc-btn").disabled = false;
+        notify(`Intake finished: ${kind} data successfully ingested.`);
+        await loadCase(state.caseId);
+        await loadQueue();
+        await loadIntelligence();
+        if (autoProcess) {
+          pollPipelineStatus(state.caseId);
+        }
+      } else if (job.status === "failed") {
+        clearInterval(state.intakeJobTimer);
+        state.intakeJobTimer = null;
+        if (cpuWarning) cpuWarning.hidden = true;
+        $("submit-audio-btn").disabled = false;
+        $("submit-doc-btn").disabled = false;
+        notify(`Intake failed: ${job.error || "Unknown error"}`, true);
+      }
+    } catch (err) {
+      clearInterval(state.intakeJobTimer);
+      state.intakeJobTimer = null;
+      if (cpuWarning) cpuWarning.hidden = true;
+      $("submit-audio-btn").disabled = false;
+      $("submit-doc-btn").disabled = false;
+      notify(`Error polling intake job: ${err.message}`, true);
+    }
+  }, 1500);
+}
+
+function pollPipelineStatus(caseId) {
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  let elapsed = 0;
+  state.pollTimer = setInterval(async () => {
+    elapsed += 2;
+    try {
+      const status = await api(`/cases/${encodeURIComponent(caseId)}/status`);
+      if (!["queued", "processing", "received", "consent_pending"].includes(status.status)) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+        notify(`Pipeline finished: ${status.status} / ${status.workflow_status}.`);
+        await loadCase(caseId);
+        await loadQueue();
+        await loadIntelligence();
+      } else if (elapsed > 180) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+      }
+    } catch (_) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+  }, 2000);
+}
+
 async function ingest(kind) {
   if (!state.caseId) { setStatus("Select a case first.", true); return; }
   const raw = $("ingest-json").value.trim();
@@ -686,6 +1021,7 @@ async function withdrawConsent() {
     $("case-view").hidden = true;
     $("welcome").hidden = false;
     await loadQueue();
+    updateIntakeGate();
   } catch (error) { setStatus(error.message, true); }
 }
 
@@ -898,6 +1234,31 @@ async function openSource(sourceId, start, end) {
       body = escapeHtml(text);
     }
     $("modal-title").textContent = `Source evidence — ${source.modality}`;
+
+    let mediaPreviewHtml = "";
+    if (source.document_ref) {
+      const docUrl = `/api/documents/${encodeURIComponent(source.document_ref)}?inline=true`;
+      if (source.modality === "stt") {
+        mediaPreviewHtml = `
+          <div class="evidence-media">
+            <p class="small-text muted">Audio evidence recording · seeking to ${source.audio_start != null ? source.audio_start + 's' : '0s'}:</p>
+            <audio id="evidence-audio-player" controls preload="metadata" src="${docUrl}"></audio>
+          </div>
+        `;
+      } else if (source.modality === "ocr") {
+        mediaPreviewHtml = `
+          <div class="evidence-media">
+            <div class="evidence-doc-header">
+              <span>Original document: <a href="${docUrl}" target="_blank" rel="noopener">${escapeHtml(source.document_ref)}</a></span>
+              ${source.page != null ? `<span class="badge">Page ${source.page}</span>` : ""}
+              ${source.bbox && source.bbox.length ? `<span class="badge">BBox: [${source.bbox.map((n) => Math.round(n)).join(", ")}]</span>` : ""}
+            </div>
+            <img class="evidence-image-preview" src="${docUrl}" alt="Evidence preview" onerror="this.style.display='none'" />
+          </div>
+        `;
+      }
+    }
+
     $("modal-body").innerHTML = `
       <p class="small-text muted">
         source_id: ${escapeHtml(source.source_id)} · segment: ${escapeHtml(source.segment_id)} ·
@@ -909,8 +1270,22 @@ async function openSource(sourceId, start, end) {
         ${source.audio_start != null ? "audio: " + source.audio_start + "s–" + (source.audio_end != null ? source.audio_end : "?") + "s · " : ""}
         ${source.warnings && source.warnings.length ? "warnings: " + escapeHtml(source.warnings.join(", ")) : ""}
       </p>
+      ${mediaPreviewHtml}
       <div class="evidence-text">${body}</div>`;
     $("modal").hidden = false;
+
+    // If audio element exists, seek to audio_start
+    const player = $("evidence-audio-player");
+    if (player && source.audio_start != null) {
+      const seekTime = Number(source.audio_start);
+      if (player.readyState >= 1) {
+        player.currentTime = seekTime;
+      } else {
+        player.addEventListener("loadedmetadata", () => {
+          player.currentTime = seekTime;
+        }, { once: true });
+      }
+    }
   } catch (error) { alert(error.message); }
 }
 
@@ -920,6 +1295,7 @@ function wire() {
   $("refresh-queue").addEventListener("click", loadQueue);
   $("refresh-intel").addEventListener("click", loadIntelligence);
   $("new-case").addEventListener("click", createCase);
+  $("copy-case-link").addEventListener("click", copyCaseLink);
   $("refresh-case").addEventListener("click", () => { if (state.caseId) loadCase(state.caseId); });
   $("assign-btn").addEventListener("click", assignCase);
   $("consent-btn").addEventListener("click", grantConsent);
@@ -942,10 +1318,30 @@ function wire() {
   $("role").addEventListener("change", () => {
     $("patient-id").style.display = $("role").value === "patient" ? "" : "none";
   });
+
+  // Direct intake wiring
+  document.querySelectorAll(".intake-tab").forEach((button) => {
+    button.addEventListener("click", () => switchIntakeTab(button.dataset.tab));
+  });
+  $("record-btn").addEventListener("click", toggleRecording);
+  $("stop-record-btn").addEventListener("click", stopRecording);
+  $("submit-audio-btn").addEventListener("click", submitAudioIntake);
+  $("submit-doc-btn").addEventListener("click", submitDocumentIntake);
+  $("submit-message-btn").addEventListener("click", submitMessageIntake);
 }
 
 loadIdentity();
 wire();
 $("patient-id").style.display = state.identity.role === "patient" ? "" : "none";
+updateIntakeGate();
 loadQueue();
 loadIntelligence();
+
+// Deep link support: If direct link was used (e.g. ?case_id=CASE_xxx or ?case=CASE_xxx), load it immediately
+try {
+  const urlParams = new URLSearchParams(window.location.search);
+  const initialCaseId = urlParams.get("case_id") || urlParams.get("case");
+  if (initialCaseId) {
+    loadCase(initialCaseId, false);
+  }
+} catch (_) {}

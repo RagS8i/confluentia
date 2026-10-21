@@ -182,7 +182,8 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
         or []
     )
     top_text = (
-        payload.get("text")
+        payload.get("transcription")
+        or payload.get("text")
         or payload.get("transcript")
         or payload.get("translated_text")
     )
@@ -199,6 +200,13 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
     )
     status = payload.get("language_status")
     captured = _parse_dt(payload.get("captured_at") or payload.get("recorded_at"))
+    doc_ref = (
+        payload.get("document_id")
+        or payload.get("document_ref")
+        or payload.get("id")
+        or payload.get("file_name")
+        or payload.get("filename")
+    )
     base = _base_id(payload, str(top_text or ""), "stt")
     parent = f"stt:{case_id[:10]}:{base}"
     notes: List[str] = []
@@ -210,7 +218,8 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                 notes.append(f"segment_{index}_invalid")
                 continue
             text = (
-                segment.get("text")
+                segment.get("transcription")
+                or segment.get("text")
                 or segment.get("transcript")
                 or segment.get("translated_text")
                 or ""
@@ -243,7 +252,7 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                             ),
                         )
                     ),
-                    document_ref=None,
+                    document_ref=str(doc_ref) if doc_ref else None,
                     page=None,
                     bbox=None,
                     audio_start=segment.get(
@@ -260,6 +269,8 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                         "transcript_id": payload.get("transcript_id") or payload.get("id"),
                         "segment_index": index,
                         "model": payload.get("model") or payload.get("stt_model"),
+                        "document_id": str(doc_ref) if doc_ref else None,
+                        "translated_text": segment.get("translated_text"),
                     },
                 )
             )
@@ -279,7 +290,7 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                 declared_language=declared,
                 source_language_status=status,
                 confidence=_norm_confidence(payload.get("confidence")),
-                document_ref=None,
+                document_ref=str(doc_ref) if doc_ref else None,
                 page=None,
                 bbox=None,
                 audio_start=payload.get("start"),
@@ -289,6 +300,8 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
                 raw_metadata={
                     "transcript_id": payload.get("transcript_id") or payload.get("id"),
                     "model": payload.get("model") or payload.get("stt_model"),
+                    "document_id": str(doc_ref) if doc_ref else None,
+                    "translated_text": payload.get("translated_text"),
                 },
             )
         )

@@ -74,21 +74,131 @@
       </section>
 
       <section class="panel intake-panel">
-        <details>
-          <summary><span>Intake source data</span><span class="summary-note">STT / OCR / message</span></summary>
-          <p class="hint">Paste the output of an existing STT or OCR pipeline. Source text and metadata are preserved.</p>
-          <div class="row">
-            <button class="btn secondary small" data-ingest="stt">STT JSON</button>
-            <button class="btn secondary small" data-ingest="ocr">OCR JSON</button>
-            <button class="btn secondary small" data-ingest="message">Patient message</button>
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Case intake</p>
+            <h2>Direct source intake</h2>
           </div>
-          <textarea id="ingest-json" rows="7" spellcheck="false" placeholder='{"transcript_id":"t1","language":"en","segments":[{"text":"I have chest pain since yesterday","start":0,"end":2.2,"confidence":0.93}]}'></textarea>
-          <div class="row">
-            <input id="upload-file" type="file" />
-            <button id="upload-btn" class="btn secondary small">Upload original</button>
+        </div>
+
+        <div id="intake-gate" class="intake-gate">
+          <p class="intake-gate-msg">Select a case and grant consent to enable intake.</p>
+        </div>
+
+        <div id="intake-body" class="intake-body">
+          <div class="intake-tabs">
+            <button id="tab-btn-audio" class="intake-tab active" data-tab="audio">Audio</button>
+            <button id="tab-btn-document" class="intake-tab" data-tab="document">Document</button>
+            <button id="tab-btn-message" class="intake-tab" data-tab="message">Message</button>
           </div>
+
+          <!-- Audio Tab -->
+          <div id="tab-audio" class="intake-tab-content">
+            <div class="intake-subflow">
+              <label>Record audio in browser</label>
+              <div class="recorder-controls">
+                <button id="record-btn" class="btn secondary small">● Record</button>
+                <button id="stop-record-btn" class="btn danger small" disabled>Stop</button>
+                <span id="record-timer" class="record-timer" hidden>00:00</span>
+              </div>
+              <audio id="record-preview" controls class="audio-preview" hidden></audio>
+            </div>
+
+            <div class="intake-subflow">
+              <label>Or upload audio file</label>
+              <input id="audio-file" type="file" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac,.webm" />
+              <p class="hint">Supported: WAV, MP3, M4A, OGG, FLAC, WebM.</p>
+            </div>
+
+            <div class="intake-options">
+              <label class="checkbox-label">
+                <input id="audio-auto-process" type="checkbox" checked />
+                <span>Auto-run pipeline</span>
+              </label>
+              <label>Target lang:
+                <select id="audio-target-lang">
+                  <option value="en-IN">English (en-IN)</option>
+                  <option value="hi-IN">Hindi (hi-IN)</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="row">
+              <button id="submit-audio-btn" class="btn small">Ingest Audio</button>
+            </div>
+          </div>
+
+          <!-- Document Tab -->
+          <div id="tab-document" class="intake-tab-content" hidden>
+            <div class="intake-subflow">
+              <label>Select medical report or image</label>
+              <input id="doc-file" type="file" accept="application/pdf,image/*,.pdf,.png,.jpg,.jpeg,.webp,.tiff" />
+              <p class="hint">Supported: PDF, PNG, JPG, JPEG, WEBP, TIFF.</p>
+            </div>
+
+            <div class="intake-options">
+              <label class="checkbox-label">
+                <input id="doc-auto-process" type="checkbox" checked />
+                <span>Auto-run pipeline</span>
+              </label>
+            </div>
+
+            <div class="row">
+              <button id="submit-doc-btn" class="btn small">Ingest Document</button>
+            </div>
+          </div>
+
+          <!-- Message Tab -->
+          <div id="tab-message" class="intake-tab-content" hidden>
+            <div class="intake-subflow">
+              <label>Typed patient message</label>
+              <textarea id="typed-message-text" rows="4" placeholder="Patient symptoms, timeline, or updates in their own words..."></textarea>
+              <div class="row compact">
+                <label>Language:
+                  <select id="typed-message-lang">
+                    <option value="en">English</option>
+                    <option value="hi">हिन्दी</option>
+                    <option value="hinglish">Hinglish</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <button id="submit-message-btn" class="btn small">Ingest Message</button>
+            </div>
+          </div>
+
+          <!-- Intake Job Progress / Status -->
+          <div id="intake-job-panel" class="intake-job-panel" hidden>
+            <div class="intake-job-header">
+              <span id="intake-job-stage" class="badge PRIORITY_REVIEW">queued</span>
+              <span id="intake-job-timer" class="small-text muted">0s</span>
+            </div>
+            <p id="intake-job-msg" class="hint">Processing intake request...</p>
+            <div id="intake-cpu-warning" class="intake-cpu-warning" hidden>
+              PaddleOCR is running on CPU; extraction may take 1-3 minutes.
+            </div>
+          </div>
+
+          <!-- Collapsed Advanced JSON/API section for developers -->
+          <details class="advanced-intake">
+            <summary>Advanced JSON / Integration APIs</summary>
+            <p class="hint">Direct JSON ingestion endpoints: /sources/stt, /sources/ocr, /sources/message, /uploads.</p>
+            <div class="row">
+              <button class="btn secondary small" data-ingest="stt">STT JSON</button>
+              <button class="btn secondary small" data-ingest="ocr">OCR JSON</button>
+              <button class="btn secondary small" data-ingest="message">Patient message</button>
+            </div>
+            <textarea id="ingest-json" rows="4" spellcheck="false" placeholder='{"transcript_id":"t1","language":"en","segments":[{"text":"...","start":0,"end":2.2}]}'></textarea>
+            <div class="row">
+              <input id="upload-file" type="file" />
+              <button id="upload-btn" class="btn secondary small">Upload original</button>
+            </div>
+          </details>
+
           <p id="ingest-status" class="hint"></p>
-        </details>
+        </div>
       </section>
     </aside>
 
@@ -114,6 +224,7 @@
             <p id="case-meta" class="hint"></p>
           </div>
           <div class="row">
+            <button id="copy-case-link" class="btn secondary small" title="Copy direct link to this case">📋 Copy Link</button>
             <button id="refresh-case" class="btn secondary small">Refresh</button>
             <button id="assign-btn" class="btn secondary small">Assign</button>
             <button id="consent-btn" class="btn secondary small">Grant consent</button>
@@ -187,6 +298,16 @@
             <section class="panel">
               <h2>Candidate contradictions</h2>
               <div id="discrepancies"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Raw Ingestion Materials</p>
+                  <h2>Ingested Sources &amp; Transcripts <span id="sources-count" class="soft"></span></h2>
+                </div>
+              </div>
+              <div id="sources-list"></div>
             </section>
 
             <section class="panel">
