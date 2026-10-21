@@ -54,7 +54,7 @@ Principal components:
 - `app/security.py` - development header auth / API-key auth and case-level access control.
 - `app/static/` - responsive dependency-free review and coordination UI.
 - `OCR1/` - PaddleOCR-VL extraction, block organizer and reading-order layout, plus an optional standalone API.
-- `STT_translation/` - Sarvam speech-to-language transcription and translation microservice.
+- `STT_translation/` - Sarvam speech-to-language implementation, plus an optional standalone API.
 - `mobile/` - Flutter client for Android and iOS.
 
 More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/STT_OCR_INTEGRATION.md](docs/STT_OCR_INTEGRATION.md), [docs/RULE_GOVERNANCE.md](docs/RULE_GOVERNANCE.md).
@@ -86,14 +86,14 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Open `http://127.0.0.1:8000/`. The UI uses development header auth by default; set `X-User-Id`, `X-Role` and (for patients) `X-Patient-Id` through the UI or API client.
 
-### Optional STT and OCR services
+### STT and OCR integrations
 
-Install their dependencies in the same environment, plus FFmpeg for audio
-decoding:
+STT dependencies are required for audio intake; OCR dependencies are required
+for document intake. Install them in the same environment, plus FFmpeg for
+audio decoding:
 
 ```powershell
-pip install -r STT_translation/requirements.txt
-pip install -r OCR1/requirements.txt
+pip install -r requirements.txt
 winget install --id Gyan.FFmpeg -e
 ```
 
@@ -102,9 +102,15 @@ PaddleOCR-VL downloads its layout and recognition models on first use into
 functional but slow; install a matching `paddlepaddle-gpu` build for a
 supported CUDA/cuDNN setup if you need faster document processing.
 
-#### Speech-to-Text microservice (Sarvam)
+#### Speech-to-Text (Sarvam, in-process)
 
-Requires `SARVAM_API_KEY` in `.env` and `ffmpeg` on `PATH`.
+Audio intake calls `STT_translation.stt.speech_to_language()` directly from the
+CareFlow background job. No STT server and no port 8001 are needed for the
+website. It requires `SARVAM_API_KEY` in `.env` and `ffmpeg` on `PATH`; audio
+is sent to Sarvam's cloud API.
+
+The standalone FastAPI wrapper remains available for independent testing or
+external integrations and uses the same function:
 
 ```powershell
 uvicorn STT_translation.api:app --host 127.0.0.1 --port 8001
@@ -270,7 +276,7 @@ Consent must be granted before ingestion/processing. In the demo, `intake` or `a
 ```
 app/                 FastAPI app, pipeline, model providers, rules, website
 OCR1/                PaddleOCR-VL extraction, organizer and reading-order parser (+ optional standalone API)
-STT_translation/     Sarvam speech-to-language transcription microservice
+STT_translation/     Sarvam speech-to-language implementation (+ optional standalone API)
 mobile/              Flutter client (Android/iOS)
 tests/               pytest suite (synthetic data, mock provider, integration)
 scripts/             extraction benchmark, rule-config validator

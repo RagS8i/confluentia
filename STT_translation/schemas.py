@@ -7,12 +7,16 @@ class Language(str, Enum):
     """
     Supported target languages, using Sarvam BCP-47 codes.
 
-    Only English is currently supported because saaras runs in "translate"
-    mode, which always returns English. Add codes here only when the
-    translation path can actually produce that language.
+    Speech is transcribed in the detected source language (``saaras`` runs in
+    ``codemix`` mode and auto-detects), then translated separately with
+    ``sarvam-translate`` when the detected language differs from the target.
+    Keep this enum in sync with the ``audio-target-lang`` options in
+    ``app/static/index.html``; add a code only when the translation path can
+    actually produce it.
     """
 
     ENGLISH = "en-IN"
+    HINDI = "hi-IN"
 
 
 class SpeechTranslationRequest(BaseModel):

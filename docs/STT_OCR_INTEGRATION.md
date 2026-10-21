@@ -1,6 +1,12 @@
 # STT and OCR integration
 
-CareFlow does not run speech-to-text or OCR itself. It accepts the upstream component's output through JSON adapters that preserve provenance. Uploaded audio/PDF/images are stored encrypted as originals; text must be supplied through the STT/OCR endpoints (or the typed-message endpoint).
+CareFlow's web audio intake calls the in-repo Sarvam implementation
+(`STT_translation.stt.speech_to_language`) directly in a background worker; no
+separate STT server is required. The independent `/speech-to-language` endpoint
+described above remains available for external integrations. Text from other
+upstream components can still be supplied through the JSON adapters
+(`/sources/stt`, `/sources/ocr`, `/sources/message`) to preserve provenance.
+Uploaded audio/PDF/images are stored encrypted as originals.
 
 Endpoints:
 
@@ -10,7 +16,7 @@ Endpoints:
 
 Consent is required. Ingesting the same payload twice is idempotent: stable source IDs are reported under `duplicates` instead of creating duplicate sources.
 
-The microservice outputs can be posted directly to CareFlow: STT results are read from `chunks`/`transcription` with `start_seconds`/`end_seconds`, and OCR results are read from `pages[].model_output.parsing_res_list` with `block_content`/`block_bbox`.
+The standalone STT/OCR service outputs can be posted directly to CareFlow: STT results are read from `chunks`/`transcription` with `start_seconds`/`end_seconds`, and OCR results are read from `pages[].model_output.parsing_res_list` with `block_content`/`block_bbox`.
 
 ## STT payload
 

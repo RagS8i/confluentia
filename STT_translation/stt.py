@@ -8,6 +8,11 @@ from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 from sarvamai import SarvamAI
 
+try:  # Imported as a package (STT_translation.stt).
+    from .errors import AudioDecodeError, TranscriptionError, TranslationError
+except ImportError:  # Run with --app-dir STT_translation.
+    from errors import AudioDecodeError, TranscriptionError, TranslationError  # type: ignore[no-redef]
+
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 if _ENV_PATH.is_file():
@@ -156,6 +161,11 @@ def speech_to_language(
         A dict with the full transcription, full translated text, target
         language, and per-chunk Sarvam outputs (detected language, language
         probability, request IDs, and timings).
+
+    Raises:
+        AudioDecodeError: the bytes could not be decoded as audio.
+        TranscriptionError: Sarvam speech-to-text failed for a chunk.
+        TranslationError: Sarvam translation failed for a chunk.
     """
 
     if not audio_bytes:
@@ -168,7 +178,14 @@ def speech_to_language(
         input_path = temp_path / f"input{suffix}"
         input_path.write_bytes(audio_bytes)
 
-        audio = AudioSegment.from_file(input_path)
+        try:
+            audio = AudioSegment.from_file(input_path)
+        except Exception as exc:
+            # Do not include the filename: uploads may carry patient identifiers.
+            raise AudioDecodeError(
+                f"Could not decode audio input (extension {suffix})."
+            ) from exc
+
         chunk_results = []
         transcriptions = []
         translations = []
@@ -179,14 +196,23 @@ def speech_to_language(
             chunk_path = temp_path / f"chunk_{index:04d}.wav"
             _export_chunk(segment, chunk_path)
 
+            # Resolve the client before per-chunk work so a missing API key is
+            # reported as a configuration error, not as a transcription outage.
+            client = get_sarvam_client()
+
             # Step 1: speech -> original-language text, with autodetection.
-            with chunk_path.open("rb") as audio_file:
-                stt_response = get_sarvam_client().speech_to_text.transcribe(
-                    file=audio_file,
-                    model=STT_MODEL,
-                    mode="codemix",
-                    language_code=STT_LANGUAGE,
-                )
+            try:
+                with chunk_path.open("rb") as audio_file:
+                    stt_response = client.speech_to_text.transcribe(
+                        file=audio_file,
+                        model=STT_MODEL,
+                        mode="codemix",
+                        language_code=STT_LANGUAGE,
+                    )
+            except Exception as exc:
+                raise TranscriptionError(
+                    f"Sarvam speech-to-text failed for chunk {index}."
+                ) from exc
 
             transcript = (stt_response.transcript or "").strip()
             detected_language = stt_response.language_code
@@ -199,12 +225,17 @@ def speech_to_language(
                 if detected_language == target_language:
                     translated_text = transcript
                 else:
-                    translation_response = get_sarvam_client().text.translate(
-                        input=transcript,
-                        source_language_code=detected_language or "auto",
-                        target_language_code=target_language,
-                        model=TRANSLATE_MODEL,
-                    )
+                    try:
+                        translation_response = client.text.translate(
+                            input=transcript,
+                            source_language_code=detected_language or "auto",
+                            target_language_code=target_language,
+                            model=TRANSLATE_MODEL,
+                        )
+                    except Exception as exc:
+                        raise TranslationError(
+                            f"Sarvam translation failed for chunk {index}."
+                        ) from exc
                     translated_text = (
                         translation_response.translated_text or ""
                     ).strip()

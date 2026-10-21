@@ -36,7 +36,7 @@ from .db import Database
 from .deletion import DeletionService
 from .escalation import EscalationError, EscalationService
 from .followups import FollowUpError, FollowUpService
-from .intake import IntakeService, OcrClient, SttClient, persist_sources
+from .intake import IntakeService, OcrClient, SttService, persist_sources
 from .model.provider import BaseProvider, build_provider
 from .pipeline.normalize import InputError, adapt_ocr, adapt_stt, adapt_typed
 from .pipeline.orchestrator import (
@@ -1652,7 +1652,7 @@ def create_app(
     settings: Optional[Settings] = None,
     provider: Optional[BaseProvider] = None,
     engine: Optional[RuleEngine] = None,
-    stt_client: Optional[SttClient] = None,
+    stt_service: Optional[SttService] = None,
     ocr_client: Optional[OcrClient] = None,
 ) -> FastAPI:
     settings = settings or load_settings()
@@ -1683,7 +1683,7 @@ def create_app(
         cipher=cipher,
         documents=documents,
         pipeline=pipeline,
-        stt_client=stt_client,
+        stt_service=stt_service,
         ocr_client=ocr_client,
     )
 

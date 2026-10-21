@@ -1,11 +1,12 @@
 """Direct audio and document intake services for CareFlow AI.
 
-Provides an async STT client, in-process OCR execution, an in-process intake job
-registry, and lifecycle handling from upload to background extraction,
-persistence, and pipeline submission.
+Provides an in-process STT runner (Sarvam ``speech_to_language``), an async OCR
+client, an in-process intake job registry, and lifecycle handling from upload to
+background extraction, persistence, and pipeline submission.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import mimetypes
 import tempfile
@@ -13,10 +14,17 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 import httpx
 from fastapi.concurrency import run_in_threadpool
+
+from STT_translation.errors import (
+    AudioDecodeError,
+    SpeechTranslationError,
+    TranscriptionError,
+    TranslationError,
+)
 
 from .config import Settings
 from .db import Database
@@ -29,8 +37,29 @@ from .storage import Cipher, DocumentStore, random_id, safe_error
 logger = logging.getLogger("careflow.intake")
 
 
+class SttTimeoutError(RuntimeError):
+    """CareFlow stopped waiting for the local speech-to-language worker.
+
+    The worker thread cannot be forcibly stopped, so a Sarvam request may keep
+    running after this error is raised; the result is discarded.
+    """
+
+
 def safe_intake_error(exc: Exception) -> str:
     """Return a safe, retryable error message for intake failures."""
+    if isinstance(exc, SttTimeoutError):
+        return "Speech processing timed out. Please retry."
+    if isinstance(exc, AudioDecodeError):
+        return (
+            "Audio could not be decoded. Supported formats: "
+            "WAV, MP3, M4A, OGG, FLAC, WebM."
+        )
+    if isinstance(exc, TranscriptionError):
+        return "Speech transcription failed. Please retry."
+    if isinstance(exc, TranslationError):
+        return "Transcript translation failed. Please retry."
+    if isinstance(exc, SpeechTranslationError):
+        return "Speech processing failed. Please retry."
     if isinstance(exc, httpx.TimeoutException):
         return "Service connection timed out. Please retry."
     if isinstance(exc, httpx.ConnectError):
@@ -101,21 +130,49 @@ def persist_sources(
 
 
 # -----------------------------------------------------------------------------
-# HTTP Clients for STT and OCR Services
+# Intake services: in-process STT, optional HTTP OCR
 # -----------------------------------------------------------------------------
 
-class SttClient:
-    """Async client for the CareFlow STT & Speech Translation service."""
+class SttService(Protocol):
+    """Minimal interface required by IntakeService for audio transcription."""
 
-    def __init__(
+    async def transcribe(
         self,
-        base_url: str = "http://127.0.0.1:8001",
-        timeout_s: float = 120.0,
-        client: Optional[httpx.AsyncClient] = None,
-    ):
-        self.base_url = base_url.rstrip("/")
+        audio_bytes: bytes,
+        filename: str = "audio.wav",
+        target_language: str = "en-IN",
+    ) -> Dict[str, Any]: ...
+
+
+def _run_speech_to_language(
+    audio_bytes: bytes,
+    target_language: str,
+    filename: str,
+) -> Dict[str, Any]:
+    """Run the repository's Sarvam implementation synchronously.
+
+    Imported lazily so CareFlow can start (and unit tests can run) without the
+    Sarvam SDK, ffmpeg or an API key unless audio intake is actually used.
+    """
+    from STT_translation.stt import speech_to_language
+
+    return speech_to_language(
+        audio_bytes=audio_bytes,
+        target_language=target_language,
+        filename=filename,
+    )
+
+
+class LocalSttService:
+    """Calls ``STT_translation.stt.speech_to_language`` in a worker thread.
+
+    CareFlow's web intake path uses this instead of HTTP to port 8001. The
+    standalone FastAPI service (``STT_translation/api.py``) remains available
+    for external callers and uses the same underlying function.
+    """
+
+    def __init__(self, timeout_s: float = 120.0):
         self.timeout_s = timeout_s
-        self._client = client
 
     async def transcribe(
         self,
@@ -123,29 +180,26 @@ class SttClient:
         filename: str = "audio.wav",
         target_language: str = "en-IN",
     ) -> Dict[str, Any]:
-        """Send audio to STT service and return structured chunk and transcription results."""
-        mime = mimetypes.guess_type(filename)[0] or "audio/wav"
-        files = {"audio": (filename, audio_bytes, mime)}
-        data = {"target_language": target_language}
+        """Return the structured transcription/translation result.
 
-        if self._client is not None:
-            resp = await self._client.post(
-                f"{self.base_url}/speech-to-language",
-                files=files,
-                data=data,
+        Transcription is CPU/IO bound (ffmpeg decode plus blocking Sarvam SDK
+        calls), so it runs via ``asyncio.to_thread``. ``wait_for`` only bounds
+        how long CareFlow waits; it cannot cancel the thread's network request.
+        """
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _run_speech_to_language,
+                    audio_bytes,
+                    target_language,
+                    filename,
+                ),
                 timeout=self.timeout_s,
             )
-            resp.raise_for_status()
-            return resp.json()
-
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            resp = await client.post(
-                f"{self.base_url}/speech-to-language",
-                files=files,
-                data=data,
-            )
-            resp.raise_for_status()
-            return resp.json()
+        except asyncio.TimeoutError as exc:
+            raise SttTimeoutError(
+                "local speech-to-language processing exceeded the configured timeout"
+            ) from exc
 
 
 class OcrClient:
@@ -314,7 +368,7 @@ class IntakeService:
         cipher: Cipher,
         documents: DocumentStore,
         pipeline: PipelineService,
-        stt_client: Optional[SttClient] = None,
+        stt_service: Optional[SttService] = None,
         ocr_client: Optional[OcrClient] = None,
         registry: Optional[IntakeJobRegistry] = None,
     ):
@@ -323,8 +377,7 @@ class IntakeService:
         self.cipher = cipher
         self.documents = documents
         self.pipeline = pipeline
-        self.stt_client = stt_client or SttClient(
-            base_url=settings.stt_base_url,
+        self.stt_service = stt_service or LocalSttService(
             timeout_s=settings.stt_timeout_s,
         )
         # An explicitly injected client keeps the historical HTTP path (used by
@@ -376,8 +429,8 @@ class IntakeService:
         try:
             job.update_stage("transcribing")
 
-            # Call STT service
-            stt_result = await self.stt_client.transcribe(
+            # Run the in-repo Sarvam implementation directly (no HTTP hop).
+            stt_result = await self.stt_service.transcribe(
                 audio_bytes=audio_bytes,
                 filename=job.filename,
                 target_language=job.target_language,
@@ -431,7 +484,10 @@ class IntakeService:
 
         except Exception as exc:
             safe_msg = f"Audio transcription failed: {safe_intake_error(exc)}"
-            logger.exception("Audio intake job %s failed: %s", job_id, safe_msg)
+            stage = getattr(exc, "stage", "integration")
+            logger.exception(
+                "Audio intake job %s failed during %s: %s", job_id, stage, safe_msg
+            )
             # The original document remains in DocumentStore and DB for retry/inspection
             job.fail(safe_msg)
 

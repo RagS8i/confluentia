@@ -21,3 +21,9 @@ torch>=2.0,<3
 pillow>=11.3,<13  # Pillow 13 requires Python 3.11+
 # Used by the OCR block organizer to call Ollama.
 requests
+
+# CareFlow STT (Sarvam). Audio decoding also requires ffmpeg on PATH.
+python-dotenv>=1.0,<2
+sarvamai==0.1.37
+# Audio decoding, silence detection, and WAV export.
+pydub==0.25.1

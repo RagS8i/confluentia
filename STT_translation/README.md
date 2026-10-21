@@ -1,9 +1,13 @@
 # Careflow STT service
 
-FastAPI wrapper around Sarvam speech-to-text and translation (`stt.py`).
+Sarvam speech-to-text and translation implementation (`stt.py`) plus an optional
+FastAPI wrapper (`api.py`).
 
-The orchestrator calls `POST /speech-to-language` over HTTP. The service is also
-independently callable. See the root `README.md` for the complete architecture.
+CareFlow's own audio intake calls `STT_translation.stt.speech_to_language()`
+directly inside a worker thread; it does **not** require this HTTP service or
+port 8001. The standalone endpoint remains available for independent testing
+and external integrations and uses the same function. See the root `README.md`
+for the complete architecture.
 
 ## Install
 

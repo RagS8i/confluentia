@@ -75,6 +75,13 @@ def _sanitize_metadata(value):
     return value
 
 
+def _restore_translation(record, texts: dict) -> None:
+    """Reattach the encrypted translation without putting text in metadata."""
+    translated = texts.get("translated_text")
+    if translated:
+        record.raw_metadata = {**record.raw_metadata, "translated_text": translated}
+
+
 class Database:
     def __init__(self, path: Path, cipher=None):
         self.path = Path(path)
@@ -448,6 +455,9 @@ class Database:
             {
                 "original_text": source.original_text,
                 "normalized_text": source.normalized_text,
+                # Translation is source text too, so keep it encrypted rather
+                # than in the unencrypted metadata column.
+                "translated_text": source.raw_metadata.get("translated_text"),
             }
         )
         metadata = _dump(
@@ -503,6 +513,7 @@ class Database:
         texts = cipher.decrypt_json(row["ciphertext"])
         record.original_text = texts["original_text"]
         record.normalized_text = texts["normalized_text"]
+        _restore_translation(record, texts)
         return record
 
     def get_sources(self, case_id: str, cipher) -> List[SourceRecord]:
@@ -517,6 +528,7 @@ class Database:
             texts = cipher.decrypt_json(row["ciphertext"])
             record.original_text = texts["original_text"]
             record.normalized_text = texts["normalized_text"]
+            _restore_translation(record, texts)
             result.append(record)
         return result
 

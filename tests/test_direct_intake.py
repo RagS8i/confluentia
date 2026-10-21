@@ -9,7 +9,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.intake import IntakeService, OcrClient, SttClient
 from app.main import create_app
 from app.model.provider import MockProvider
 from tests.conftest import ADMIN, CLINICIAN, INTAKE, FIXED_KEY, RULES, consent, new_case, patient_headers
@@ -108,11 +107,11 @@ def make_test_settings(tmp_path: Path, **overrides) -> Settings:
 def intake_client_factory(tmp_path):
     clients = []
 
-    def factory(stt_client=None, ocr_client=None, **settings_overrides):
+    def factory(stt_service=None, ocr_client=None, **settings_overrides):
         app = create_app(
             settings=make_test_settings(tmp_path, **settings_overrides),
             provider=MockProvider(),
-            stt_client=stt_client or FakeSttClient(),
+            stt_service=stt_service or FakeSttClient(),
             ocr_client=ocr_client or FakeOcrClient(),
         )
         client = TestClient(app)
@@ -127,7 +126,7 @@ def intake_client_factory(tmp_path):
 def test_direct_audio_intake_success_and_provenance(intake_client_factory):
     """Audio intake uploads file, runs STT, preserves original Hindi text and document_ref."""
     fake_stt = FakeSttClient()
-    client = intake_client_factory(stt_client=fake_stt)
+    client = intake_client_factory(stt_service=fake_stt)
 
     case_id = new_case(client, headers=CLINICIAN, patient_id="pt_audio_01")
     consent(client, case_id, headers=INTAKE)
@@ -145,6 +144,8 @@ def test_direct_audio_intake_success_and_provenance(intake_client_factory):
     job_id = data["job_id"]
     doc_id = data["document_id"]
     assert data["kind"] == "audio"
+    assert data["stage"] == "queued"
+    assert data["status"] == "queued"
     assert data["poll"] == f"/api/cases/{case_id}/intake/jobs/{job_id}"
 
     # Poll job status
@@ -315,8 +316,8 @@ def test_direct_intake_oversized_upload_rejected(intake_client_factory):
 
 def test_direct_intake_service_failure_preserves_original_document(intake_client_factory):
     """When STT/OCR service fails, original document is preserved and job marked failed."""
-    failing_stt = FakeSttClient(should_fail=True, failure_message="STT Service Connection Refused")
-    client = intake_client_factory(stt_client=failing_stt)
+    failing_stt = FakeSttClient(should_fail=True, failure_message="Sarvam transcription unavailable")
+    client = intake_client_factory(stt_service=failing_stt)
 
     case_id = new_case(client, headers=CLINICIAN, patient_id="pt_fail_01")
     consent(client, case_id, headers=INTAKE)
@@ -338,7 +339,7 @@ def test_direct_intake_service_failure_preserves_original_document(intake_client
     job = poll_resp.json()
     assert job["stage"] == "failed"
     assert job["status"] == "failed"
-    assert "STT Service Connection Refused" in job["error"]
+    assert "Sarvam transcription unavailable" in job["error"]
 
     # Original document is NOT deleted and can be retrieved or retried
     doc_resp = client.get(f"/api/documents/{doc_id}", headers=CLINICIAN)

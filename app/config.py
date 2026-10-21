@@ -135,9 +135,10 @@ class Settings:
     outbound_timeout_s: float = 5.0
     wait_estimate_min_sample: int = 3
 
-    # Direct intake external service settings (STT & OCR)
-    stt_base_url: str = "http://127.0.0.1:8001"
+    # Direct intake external service settings (STT is in-process; OCR is HTTP)
     ocr_base_url: str = "http://127.0.0.1:8002"
+    # Upper bound on how long CareFlow waits for the blocking Sarvam call.
+    # Exceeding it fails the job, but cannot stop an in-flight network request.
     stt_timeout_s: float = 120.0
     ocr_timeout_s: float = 300.0
 
@@ -206,9 +207,8 @@ def load_settings() -> Settings:
         outbound_webhook_url=os.getenv("CAREFLOW_OUTBOUND_WEBHOOK_URL") or None,
         outbound_timeout_s=_float("CAREFLOW_OUTBOUND_TIMEOUT_S", 5.0),
         wait_estimate_min_sample=_int("CAREFLOW_WAIT_ESTIMATE_MIN_SAMPLE", 3),
-        stt_base_url=os.getenv("CAREFLOW_STT_BASE_URL", "http://127.0.0.1:8001").rstrip("/"),
-        ocr_base_url=os.getenv("CAREFLOW_OCR_BASE_URL", "http://127.0.0.1:8002").rstrip("/"),
         stt_timeout_s=_float("CAREFLOW_STT_TIMEOUT_S", 120.0),
+        ocr_base_url=os.getenv("CAREFLOW_OCR_BASE_URL", "http://127.0.0.1:8002").rstrip("/"),
         ocr_timeout_s=_float("CAREFLOW_OCR_TIMEOUT_S", 300.0),
     )
     for directory in (settings.data_dir, settings.uploads_dir):
