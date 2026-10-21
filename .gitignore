@@ -8,3 +8,6 @@ reports/
 *.db
 *.sqlite3
 .careflow.key
+myenv
+audio1.ogg
+Screenshot.png

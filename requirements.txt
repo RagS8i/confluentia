@@ -1,6 +1,23 @@
+# CareFlow web app
 fastapi==0.111.0
 uvicorn==0.30.1
 pydantic==2.12.5
 httpx==0.28.1
 cryptography==46.0.5
 python-multipart==0.0.32
+
+# CareFlow OCR (PaddleOCR-VL). On Linux/CUDA, replace paddlepaddle with the
+# matching paddlepaddle-gpu build. 3.3.1 has no Linux aarch64 wheel; 3.2.2 is
+# the newest one that does.
+paddleocr==3.7.0
+# PaddleOCR-VL-1.6 lives in PaddleX and requires its "ocr" extras; the base
+# paddleocr dependency alone does not install them.
+paddlex[ocr]==3.7.2
+paddlepaddle==3.3.1; platform_machine != "aarch64"
+paddlepaddle==3.2.2; platform_machine == "aarch64"
+# PaddleX imports modelscope, which imports torch even for Paddle-only
+# inference. Keep torch installed and preloaded before Paddle (see model.py).
+torch>=2.0,<3
+pillow>=11.3,<13  # Pillow 13 requires Python 3.11+
+# Used by the OCR block organizer to call Ollama.
+requests

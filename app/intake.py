@@ -1,18 +1,22 @@
 """Direct audio and document intake services for CareFlow AI.
 
-Provides async clients for STT and OCR services, an in-process intake job registry,
-and lifecycle handling from upload to background extraction, persistence, and pipeline submission.
+Provides an async STT client, in-process OCR execution, an in-process intake job
+registry, and lifecycle handling from upload to background extraction,
+persistence, and pipeline submission.
 """
 from __future__ import annotations
 
 import logging
 import mimetypes
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
+from fastapi.concurrency import run_in_threadpool
 
 from .config import Settings
 from .db import Database
@@ -184,6 +188,28 @@ class OcrClient:
             return resp.json()
 
 
+def process_document_locally(
+    document_bytes: bytes,
+    filename: str,
+    model: str,
+    base_url: str,
+) -> Dict[str, Any]:
+    """Run PaddleOCR-VL and the organizer in-process.
+
+    ``ocr_pipeline.process_document`` takes a filesystem path, so the uploaded
+    bytes are written to a short-lived temporary file. This function is blocking
+    (Paddle inference plus a synchronous Ollama request) and must be called from
+    a worker thread.
+    """
+    from ocr_pipeline import process_document
+
+    suffix = Path(filename).suffix.lower() or ".bin"
+    with tempfile.TemporaryDirectory(prefix="careflow-ocr-") as temp_dir:
+        path = Path(temp_dir) / f"document{suffix}"
+        path.write_bytes(document_bytes)
+        return process_document(path, model=model, base_url=base_url)
+
+
 # -----------------------------------------------------------------------------
 # Intake Job Registry
 # -----------------------------------------------------------------------------
@@ -301,6 +327,10 @@ class IntakeService:
             base_url=settings.stt_base_url,
             timeout_s=settings.stt_timeout_s,
         )
+        # An explicitly injected client keeps the historical HTTP path (used by
+        # tests and by deployments that still want the standalone OCR service).
+        # Without one, document intake runs ocr_pipeline in-process.
+        self._ocr_client_injected = ocr_client is not None
         self.ocr_client = ocr_client or OcrClient(
             base_url=settings.ocr_base_url,
             timeout_s=settings.ocr_timeout_s,
@@ -421,11 +451,25 @@ class IntakeService:
         try:
             job.update_stage("reading")
 
-            # Call OCR service
-            ocr_result = await self.ocr_client.extract(
-                document_bytes=document_bytes,
-                filename=job.filename,
-            )
+            if self._ocr_client_injected:
+                # Backward-compatible path for tests and external deployments.
+                ocr_result = await self.ocr_client.extract(
+                    document_bytes=document_bytes,
+                    filename=job.filename,
+                )
+            else:
+                # Run PaddleOCR-VL + organizer in-process. Both are blocking,
+                # so keep them off the event loop.
+                ollama_url = self.settings.ollama_base_url.rstrip("/")
+                if not ollama_url.endswith("/api/chat"):
+                    ollama_url = f"{ollama_url}/api/chat"
+                ocr_result = await run_in_threadpool(
+                    process_document_locally,
+                    document_bytes,
+                    job.filename,
+                    self.settings.ollama_model,
+                    ollama_url,
+                )
 
             # Re-check case deletion / consent before persistence so withdrawn
             # cases cannot be repopulated.

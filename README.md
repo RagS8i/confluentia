@@ -53,7 +53,7 @@ Principal components:
 - `app/db.py`, `app/storage.py`, `app/deletion.py` - SQLite persistence, encryption, deletion jobs.
 - `app/security.py` - development header auth / API-key auth and case-level access control.
 - `app/static/` - responsive dependency-free review and coordination UI.
-- `OCR1/` - PaddleOCR-VL document OCR microservice and reading-order layout extraction.
+- `OCR1/` - PaddleOCR-VL extraction, block organizer and reading-order layout, plus an optional standalone API.
 - `STT_translation/` - Sarvam speech-to-language transcription and translation microservice.
 - `mobile/` - Flutter client for Android and iOS.
 
@@ -110,7 +110,15 @@ Requires `SARVAM_API_KEY` in `.env` and `ffmpeg` on `PATH`.
 uvicorn STT_translation.api:app --host 127.0.0.1 --port 8001
 ```
 
-#### OCR microservice (PaddleOCR-VL)
+#### OCR (PaddleOCR-VL, in-process)
+
+Document intake calls `ocr_pipeline.process_document()` directly from the
+CareFlow background worker. No OCR server and no port 8002 are needed for the
+website. PaddleOCR-VL runs locally and the block organizer uses the configured
+Ollama model.
+
+The standalone FastAPI wrapper remains available for independent testing or
+external integrations and uses the same extraction path:
 
 ```powershell
 uvicorn OCR1.api:app --host 127.0.0.1 --port 8002
@@ -248,7 +256,7 @@ Consent must be granted before ingestion/processing. In the demo, `intake` or `a
 
 - Not a diagnosis, prescription, disposition or clinical-clearance system; no autonomous patient-facing advice.
 - Demo thresholds are not an approved triage protocol and have not been clinically validated.
-- STT/OCR are external; this repo provides integration adapters, not speech/image models. Do not fabricate confidence or clinical accuracy metrics.
+- STT (Sarvam) and OCR (PaddleOCR-VL) are external model components; this repo integrates them and preserves provenance. Do not fabricate confidence or clinical accuracy metrics.
 - Patient messages are curated templates, not generative clinical advice. Only `en`, `hi` and `hinglish` variants exist; missing variants fail safely rather than being machine-translated at runtime.
 - Wait estimates are operational estimates, not guarantees. They are unavailable for emergency cases and when staffing, review-time data or the minimum sample is missing.
 - Follow-up suggestions do not replace clinician review, emergency escalation or direct communication.
@@ -261,7 +269,7 @@ Consent must be granted before ingestion/processing. In the demo, `intake` or `a
 
 ```
 app/                 FastAPI app, pipeline, model providers, rules, website
-OCR1/                PaddleOCR-VL OCR microservice and reading order parser
+OCR1/                PaddleOCR-VL extraction, organizer and reading-order parser (+ optional standalone API)
 STT_translation/     Sarvam speech-to-language transcription microservice
 mobile/              Flutter client (Android/iOS)
 tests/               pytest suite (synthetic data, mock provider, integration)
