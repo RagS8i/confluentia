@@ -381,7 +381,7 @@ def test_ui_target_languages_match_schema():
     index_path = (
         Path(__file__).resolve().parent.parent / "app" / "static" / "index.html"
     )
-    html = index_path.read_text()
+    html = index_path.read_text(encoding="utf-8")
     select = re.search(
         r'<select id="audio-target-lang">(.*?)</select>', html, re.S
     )

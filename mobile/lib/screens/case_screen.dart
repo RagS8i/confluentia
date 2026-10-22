@@ -988,9 +988,10 @@ class _CaseScreenState extends State<CaseScreen> {
             )
           : null,
       child: detail.followups.isEmpty
-          ? const EmptyState(
-              'No follow-up questions yet. Questions are generated from the '
-              'reviewed summary and require staff approval.',
+          ? EmptyState(
+              detail.workflowStatus == 'EMERGENCY'
+                  ? 'Routine follow-up questions are suppressed because an EMERGENCY workflow status is active. Immediate clinical escalation takes priority.'
+                  : 'No follow-up questions yet. Questions are generated from the reviewed summary and require staff approval.',
               icon: Icons.question_answer_outlined,
             )
           : Column(

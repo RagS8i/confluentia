@@ -621,7 +621,10 @@ function renderCommunications(items) {
 function renderFollowups(items, answers) {
   const container = $("followups");
   if (!items.length) {
-    container.innerHTML = '<p class="hint">No follow-up questions yet. Run the pipeline, then sync from the summary.</p>';
+    const isEmergency = state.caseData?.case?.workflow_status === "EMERGENCY";
+    container.innerHTML = isEmergency
+      ? '<p class="hint" style="color: var(--danger);">Routine follow-up questions are suppressed because an EMERGENCY workflow status is active. Immediate escalation takes priority.</p>'
+      : '<p class="hint">No follow-up questions yet. Run the pipeline, then sync from the summary.</p>';
     $("followup-answers").innerHTML = "";
     return;
   }
@@ -1270,8 +1273,19 @@ async function escalationAction(escalationId, action) {
 async function syncFollowups() {
   if (!state.caseId) return;
   try {
-    await api(`/cases/${encodeURIComponent(state.caseId)}/followups/sync`, { method: "POST" });
-    notify("Follow-up questions synced from the current summary.");
+    const res = await api(`/cases/${encodeURIComponent(state.caseId)}/followups/sync`, { method: "POST" });
+    const count = (res && res.items) ? res.items.length : 0;
+    if (count > 0) {
+      notify(`Synced ${count} follow-up question(s) from current summary.`);
+    } else {
+      if (state.caseData?.case?.workflow_status === "EMERGENCY") {
+        notify("Routine follow-up questions are suppressed for EMERGENCY cases. Immediate escalation takes priority.", true);
+      } else if (!state.caseData?.summary) {
+        notify("No clinical summary available yet. Please run the pipeline first.", true);
+      } else {
+        notify("No new follow-up questions suggested by the gap checks.");
+      }
+    }
     await loadCase(state.caseId);
   } catch (error) { notify(error.message, true); }
 }
