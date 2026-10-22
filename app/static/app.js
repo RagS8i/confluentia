@@ -869,10 +869,17 @@ function startIntakeJobPolling(jobId, kind, autoProcess) {
       }
       if (msgEl) {
         if (job.stage === "transcribing") msgEl.textContent = "Transcribing audio via Sarvam STT...";
-        else if (job.stage === "reading") msgEl.textContent = "Reading layout and text via PaddleOCR...";
+        else if (job.stage === "reading") msgEl.textContent = "Reading layout and text via GLM-OCR...";
+        else if (job.stage === "organizing") msgEl.textContent = "Filtering clinically relevant text...";
         else if (job.stage === "ingesting") msgEl.textContent = "Persisting normalized sources and metadata...";
         else if (job.stage === "processing") msgEl.textContent = "Submitting case to clinical pipeline...";
-        else if (job.status === "complete") msgEl.textContent = `Completed! ${job.result?.inserted || 0} source(s) inserted.`;
+        else if (job.status === "complete") {
+          const timings = job.result?.timings || {};
+          const timingText = timings.ocr_seconds != null
+            ? ` · OCR ${timings.ocr_seconds}s, organizer ${timings.organizer_seconds ?? "?"}s`
+            : "";
+          msgEl.textContent = `Completed! ${job.result?.inserted || 0} source(s) inserted.${timingText}`;
+        }
         else if (job.status === "failed") msgEl.textContent = `Error: ${job.error || "Intake processing failed."}`;
       }
 

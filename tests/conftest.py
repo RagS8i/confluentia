@@ -103,12 +103,46 @@ def ocr_payload(
     language="en",
     file_name="report.pdf",
 ):
+    """Build the structured OCR contract consumed by /sources/ocr.
+
+    `pages` keeps the old test-call convenience shape; this helper flattens it
+    into the source-level output emitted by the organizer.
+    """
+    sources = []
+    for page_index, page in enumerate(pages, start=1):
+        page_no = page.get("page", page.get("page_number", page_index))
+        blocks = page.get("blocks")
+        if blocks:
+            for block in blocks:
+                sources.append(
+                    {
+                        "block_id": block.get("block_id"),
+                        "text": block.get("text", ""),
+                        "page": page_no,
+                        "bbox": block.get("bbox") or [],
+                        "confidence": block.get("confidence", page.get("confidence")),
+                        "unreadable": bool(block.get("unreadable", False)),
+                    }
+                )
+        elif page.get("text"):
+            sources.append(
+                {
+                    "block_id": page.get("block_id"),
+                    "text": page["text"],
+                    "page": page_no,
+                    "bbox": page.get("bbox") or [],
+                    "confidence": page.get("confidence"),
+                    "unreadable": bool(page.get("unreadable", False)),
+                }
+            )
     return {
         "document_id": document_id,
         "file_name": file_name,
         "language": language,
-        "pages": pages,
-        "model": "synthetic-ocr",
+        "is_medical": True,
+        "document_type": "other_medical",
+        "sources": sources,
+        "ocr_model": "synthetic-ocr",
     }
 
 

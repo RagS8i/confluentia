@@ -1,20 +1,22 @@
 """Direct audio and document intake services for CareFlow AI.
 
-Provides an in-process STT runner (Sarvam ``speech_to_language``), an async OCR
-client, an in-process intake job registry, and lifecycle handling from upload to
-background extraction, persistence, and pipeline submission.
+Provides in-process STT (Sarvam ``speech_to_language``) and OCR
+(``OCR1.model`` + ``OCR1.organizer``) runners, an intake job registry, and
+lifecycle handling from upload to background extraction, persistence, and
+pipeline submission.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-import mimetypes
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 import httpx
 from fastapi.concurrency import run_in_threadpool
@@ -28,7 +30,7 @@ from STT_translation.errors import (
 
 from .config import Settings
 from .db import Database
-from .pipeline.normalize import InputError, adapt_ocr, adapt_stt
+from .pipeline.normalize import InputError, adapt_stt, sources_from_ocr_pipeline
 from .pipeline.orchestrator import PipelineService
 from .schemas import CaseRecord, CaseStatus, SourceRecord
 from .security import Principal
@@ -144,6 +146,11 @@ class SttService(Protocol):
     ) -> Dict[str, Any]: ...
 
 
+# Blocking document processor signature. The default is process_document_locally;
+# tests inject a deterministic callable without reintroducing an HTTP OCR client.
+DocumentProcessor = Callable[..., Dict[str, Any]]
+
+
 def _run_speech_to_language(
     audio_bytes: bytes,
     target_language: str,
@@ -202,44 +209,9 @@ class LocalSttService:
             ) from exc
 
 
-class OcrClient:
-    """Async client for the CareFlow OCR service."""
-
-    def __init__(
-        self,
-        base_url: str = "http://127.0.0.1:8002",
-        timeout_s: float = 300.0,
-        client: Optional[httpx.AsyncClient] = None,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.timeout_s = timeout_s
-        self._client = client
-
-    async def extract(
-        self,
-        document_bytes: bytes,
-        filename: str = "document.pdf",
-    ) -> Dict[str, Any]:
-        """Send document to OCR service and return layout and page model output."""
-        mime = mimetypes.guess_type(filename)[0] or "application/pdf"
-        files = {"file": (filename, document_bytes, mime)}
-
-        if self._client is not None:
-            resp = await self._client.post(
-                f"{self.base_url}/ocr",
-                files=files,
-                timeout=self.timeout_s,
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            resp = await client.post(
-                f"{self.base_url}/ocr",
-                files=files,
-            )
-            resp.raise_for_status()
-            return resp.json()
+# GLM-OCR runs on a single local Ollama instance; serialize extraction across
+# background intake jobs.
+_OCR_LOCK = threading.Lock()
 
 
 def process_document_locally(
@@ -247,21 +219,60 @@ def process_document_locally(
     filename: str,
     model: str,
     base_url: str,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """Run PaddleOCR-VL and the organizer in-process.
+    """Run GLM-OCR and the organizer in-process.
 
-    ``ocr_pipeline.process_document`` takes a filesystem path, so the uploaded
-    bytes are written to a short-lived temporary file. This function is blocking
-    (Paddle inference plus a synchronous Ollama request) and must be called from
-    a worker thread.
+    ``extract_document`` takes a filesystem path, so the uploaded bytes are
+    written to a short-lived temporary file. This function is blocking (Ollama
+    vision inference plus a synchronous Ollama text request) and must be called
+    from a worker thread.
     """
-    from ocr_pipeline import process_document
+    from OCR1.model import extract_document
+    from OCR1.organizer import organize_ocr_result
 
     suffix = Path(filename).suffix.lower() or ".bin"
     with tempfile.TemporaryDirectory(prefix="careflow-ocr-") as temp_dir:
         path = Path(temp_dir) / f"document{suffix}"
         path.write_bytes(document_bytes)
-        return process_document(path, model=model, base_url=base_url)
+
+        started = time.perf_counter()
+        # GLM-OCR inference is serialized to avoid concurrent model loads.
+        with _OCR_LOCK:
+            ocr_output = extract_document(path)
+        ocr_seconds = time.perf_counter() - started
+
+        # OCR is done; the remaining delay is the text organizer. Expose this
+        # as a distinct job stage so the UI does not look stuck on "reading".
+        if on_stage is not None:
+            on_stage("organizing")
+
+        started = time.perf_counter()
+        result = organize_ocr_result(
+            ocr_output,
+            model=model,
+            base_url=base_url,
+        )
+        organizer_seconds = time.perf_counter() - started
+
+    result["timings"] = {
+        "ocr_seconds": round(ocr_seconds, 2),
+        "organizer_seconds": round(organizer_seconds, 2),
+    }
+    return result
+
+
+def _supports_on_stage(processor: DocumentProcessor) -> bool:
+    """Return True when an injected processor accepts the progress callback."""
+    try:
+        signature = inspect.signature(processor)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "on_stage"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -275,7 +286,7 @@ class IntakeJob:
     document_id: str
     kind: str  # "audio" | "document"
     filename: str
-    stage: str = "queued"  # queued -> transcribing/reading -> ingesting -> processing -> complete/failed
+    stage: str = "queued"  # queued -> transcribing/reading -> organizing -> ingesting -> processing -> complete/failed
     status: str = "queued"  # queued | running | complete | failed
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -288,7 +299,13 @@ class IntakeJob:
         self.stage = stage
         if status:
             self.status = status
-        elif stage in ("transcribing", "reading", "ingesting", "processing"):
+        elif stage in (
+            "transcribing",
+            "reading",
+            "organizing",
+            "ingesting",
+            "processing",
+        ):
             self.status = "running"
         elif stage == "complete":
             self.status = "complete"
@@ -369,7 +386,7 @@ class IntakeService:
         documents: DocumentStore,
         pipeline: PipelineService,
         stt_service: Optional[SttService] = None,
-        ocr_client: Optional[OcrClient] = None,
+        document_processor: Optional[DocumentProcessor] = None,
         registry: Optional[IntakeJobRegistry] = None,
     ):
         self.settings = settings
@@ -380,14 +397,7 @@ class IntakeService:
         self.stt_service = stt_service or LocalSttService(
             timeout_s=settings.stt_timeout_s,
         )
-        # An explicitly injected client keeps the historical HTTP path (used by
-        # tests and by deployments that still want the standalone OCR service).
-        # Without one, document intake runs ocr_pipeline in-process.
-        self._ocr_client_injected = ocr_client is not None
-        self.ocr_client = ocr_client or OcrClient(
-            base_url=settings.ocr_base_url,
-            timeout_s=settings.ocr_timeout_s,
-        )
+        self.document_processor = document_processor or process_document_locally
         self.registry = registry or IntakeJobRegistry()
 
     def create_job(
@@ -498,7 +508,7 @@ class IntakeService:
         user_id: str,
         role: str,
     ) -> None:
-        """Run OCR for an intake job, adapt the document layout, and persist sources."""
+        """Run OCR for an intake job, validate structured sources, and persist."""
         job = self.registry.get(job_id)
         if job is None:
             logger.error("Intake job %s not found in registry", job_id)
@@ -507,25 +517,31 @@ class IntakeService:
         try:
             job.update_stage("reading")
 
-            if self._ocr_client_injected:
-                # Backward-compatible path for tests and external deployments.
-                ocr_result = await self.ocr_client.extract(
-                    document_bytes=document_bytes,
-                    filename=job.filename,
+            # GLM-OCR + organizer are blocking, so keep them off the
+            # event loop. There is no HTTP OCR microservice call.
+            ollama_url = self.settings.ollama_base_url.rstrip("/")
+            if not ollama_url.endswith("/api/chat"):
+                ollama_url = f"{ollama_url}/api/chat"
+            processor_args = (
+                document_bytes,
+                job.filename,
+                self.settings.ollama_model,
+                ollama_url,
+            )
+            if _supports_on_stage(self.document_processor):
+                ocr_result = await run_in_threadpool(
+                    self.document_processor,
+                    *processor_args,
+                    on_stage=job.update_stage,
                 )
             else:
-                # Run PaddleOCR-VL + organizer in-process. Both are blocking,
-                # so keep them off the event loop.
-                ollama_url = self.settings.ollama_base_url.rstrip("/")
-                if not ollama_url.endswith("/api/chat"):
-                    ollama_url = f"{ollama_url}/api/chat"
                 ocr_result = await run_in_threadpool(
-                    process_document_locally,
-                    document_bytes,
-                    job.filename,
-                    self.settings.ollama_model,
-                    ollama_url,
+                    self.document_processor,
+                    *processor_args,
                 )
+            timings = ocr_result.pop("timings", None)
+            if not isinstance(timings, dict):
+                timings = {}
 
             # Re-check case deletion / consent before persistence so withdrawn
             # cases cannot be repopulated.
@@ -539,11 +555,12 @@ class IntakeService:
                 logger.warning("Consent withdrawn for case %s before OCR persistence; aborted.", job.case_id)
                 return
 
-            # Override the service's temporary file_name with the original filename
-            # and pass the internal document_id; preserve page/bbox metadata.
+            # Override the pipeline's temporary file_name with the original
+            # filename and pass the internal document_id; preserve page
+            # metadata and the OCR model tag reported by the extractor.
             ocr_result["file_name"] = job.filename
             ocr_result["document_id"] = job.document_id
-            sources, notes = adapt_ocr(ocr_result, job.case_id)
+            sources, notes = sources_from_ocr_pipeline(ocr_result, job.case_id)
 
             job.update_stage("ingesting")
             ingest_res = persist_sources(
@@ -565,14 +582,20 @@ class IntakeService:
                 else:
                     self.pipeline.submit(job.case_id, actor=user_id)
 
+            timings["total_seconds"] = round(job.elapsed_seconds, 2)
             job.finish({
                 "document_id": job.document_id,
                 "inserted": len(ingest_res["inserted"]),
                 "duplicates": len(ingest_res["duplicates"]),
                 "notes": notes,
                 "sources": ingest_res["sources"],
+                "timings": timings,
             })
-            logger.info("Document intake job %s completed successfully", job_id)
+            logger.info(
+                "Document intake job %s completed successfully (%s)",
+                job_id,
+                timings,
+            )
 
         except Exception as exc:
             safe_msg = f"Document OCR extraction failed: {safe_intake_error(exc)}"

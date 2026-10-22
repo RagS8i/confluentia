@@ -49,41 +49,52 @@ class FakeSttClient:
         }
 
 
-class FakeOcrClient:
-    """Deterministic in-memory OCR client for testing."""
+class FakeOcrProcessor:
+    """Deterministic in-process OCR processor for testing."""
 
     def __init__(self, should_fail: bool = False, failure_message: str = "PaddleOCR engine error"):
         self.should_fail = should_fail
         self.failure_message = failure_message
-        self.extract_calls = []
+        self.calls = []
 
-    async def extract(
+    def __call__(
         self,
         document_bytes: bytes,
-        filename: str = "document.pdf",
+        filename: str,
+        model: str,
+        base_url: str,
     ) -> Dict[str, Any]:
-        self.extract_calls.append({"bytes_len": len(document_bytes), "filename": filename})
+        self.calls.append(
+            {
+                "bytes_len": len(document_bytes),
+                "filename": filename,
+                "model": model,
+                "base_url": base_url,
+            }
+        )
         if self.should_fail:
             raise RuntimeError(self.failure_message)
         return {
             "file_name": "temp_paddle_upload.pdf",  # Simulated temporary name to test overriding
-            "page_count": 1,
-            "pages": [
+            "is_medical": True,
+            "document_type": "lab_report",
+            "sources": [
                 {
-                    "page_number": 1,
-                    "blocks": [
-                        {
-                            "text": "Blood Pressure: 160/100 mmHg",
-                            "bbox": [20.0, 30.0, 180.0, 50.0],
-                            "confidence": 0.97,
-                        },
-                        {
-                            "text": "Troponin I: 0.12 ng/mL (High)",
-                            "bbox": [20.0, 60.0, 210.0, 80.0],
-                            "confidence": 0.95,
-                        },
-                    ],
-                }
+                    "block_id": "p1_b1",
+                    "text": "Blood Pressure: 160/100 mmHg",
+                    "page": 1,
+                    "bbox": [20.0, 30.0, 180.0, 50.0],
+                    "confidence": 0.97,
+                    "unreadable": False,
+                },
+                {
+                    "block_id": "p1_b2",
+                    "text": "Troponin I: 0.12 ng/mL (High)",
+                    "page": 1,
+                    "bbox": [20.0, 60.0, 210.0, 80.0],
+                    "confidence": 0.95,
+                    "unreadable": False,
+                },
             ],
         }
 
@@ -107,12 +118,12 @@ def make_test_settings(tmp_path: Path, **overrides) -> Settings:
 def intake_client_factory(tmp_path):
     clients = []
 
-    def factory(stt_service=None, ocr_client=None, **settings_overrides):
+    def factory(stt_service=None, document_processor=None, **settings_overrides):
         app = create_app(
             settings=make_test_settings(tmp_path, **settings_overrides),
             provider=MockProvider(),
             stt_service=stt_service or FakeSttClient(),
-            ocr_client=ocr_client or FakeOcrClient(),
+            document_processor=document_processor or FakeOcrProcessor(),
         )
         client = TestClient(app)
         clients.append(client)
@@ -182,8 +193,8 @@ def test_direct_audio_intake_success_and_provenance(intake_client_factory):
 
 def test_direct_document_intake_success_and_bbox_preservation(intake_client_factory):
     """Document intake uploads file, runs OCR, preserves bbox, pages and original filename."""
-    fake_ocr = FakeOcrClient()
-    client = intake_client_factory(ocr_client=fake_ocr)
+    fake_ocr = FakeOcrProcessor()
+    client = intake_client_factory(document_processor=fake_ocr)
 
     case_id = new_case(client, headers=CLINICIAN, patient_id="pt_doc_01")
     consent(client, case_id, headers=INTAKE)
@@ -222,6 +233,84 @@ def test_direct_document_intake_success_and_bbox_preservation(intake_client_fact
     doc_resp = client.get(f"/api/documents/{doc_id}", headers=CLINICIAN)
     assert doc_resp.status_code == 200
     assert doc_resp.content == pdf_data
+
+
+def test_direct_document_intake_reports_stage_timings(intake_client_factory):
+    """A stage-aware processor can report OCR/organizer timing and progress."""
+
+    class StageAwareOcrProcessor(FakeOcrProcessor):
+        def __init__(self):
+            super().__init__()
+            self.stages = []
+
+        def __call__(self, document_bytes, filename, model, base_url, on_stage=None):
+            if on_stage is not None:
+                self.stages.append("organizing")
+                on_stage("organizing")
+            result = super().__call__(document_bytes, filename, model, base_url)
+            result["timings"] = {
+                "ocr_seconds": 0.01,
+                "organizer_seconds": 0.02,
+            }
+            return result
+
+    processor = StageAwareOcrProcessor()
+    client = intake_client_factory(document_processor=processor)
+    case_id = new_case(client, headers=CLINICIAN, patient_id="pt_doc_timing")
+    consent(client, case_id, headers=INTAKE)
+
+    files = {"file": ("lab.pdf", io.BytesIO(b"%PDF-1.4 sample"), "application/pdf")}
+    resp = client.post(
+        f"/api/cases/{case_id}/intake/document?auto_process=false",
+        headers=CLINICIAN,
+        files=files,
+    )
+    assert resp.status_code == 202
+    job = client.get(
+        f"/api/cases/{case_id}/intake/jobs/{resp.json()['job_id']}",
+        headers=CLINICIAN,
+    ).json()
+
+    assert processor.stages == ["organizing"]
+    assert job["status"] == "complete"
+    assert job["result"]["timings"]["ocr_seconds"] == 0.01
+    assert job["result"]["timings"]["organizer_seconds"] == 0.02
+    assert job["result"]["timings"]["total_seconds"] >= 0
+
+
+def test_direct_document_intake_rejects_non_medical_document(intake_client_factory):
+    """The organizer's non-medical classification stops persistence."""
+
+    class NonMedicalProcessor:
+        def __call__(self, document_bytes, filename, model, base_url):
+            return {
+                "file_name": filename,
+                "is_medical": False,
+                "document_type": "non_medical",
+                "sources": [],
+            }
+
+    client = intake_client_factory(document_processor=NonMedicalProcessor())
+    case_id = new_case(client, headers=CLINICIAN, patient_id="pt_doc_nonmedical")
+    consent(client, case_id, headers=INTAKE)
+
+    files = {"file": ("architecture.png", io.BytesIO(b"\x89PNG\r\n"), "image/png")}
+    resp = client.post(
+        f"/api/cases/{case_id}/intake/document?auto_process=false",
+        headers=CLINICIAN,
+        files=files,
+    )
+    assert resp.status_code == 202
+    job_id = resp.json()["job_id"]
+
+    job = client.get(
+        f"/api/cases/{case_id}/intake/jobs/{job_id}", headers=CLINICIAN
+    ).json()
+    assert job["status"] == "failed"
+    assert "clinically relevant" in job["error"]
+
+    case_data = client.get(f"/api/cases/{case_id}", headers=CLINICIAN).json()
+    assert case_data.get("sources", []) == []
 
 
 def test_direct_intake_missing_consent_is_rejected(intake_client_factory):
@@ -396,7 +485,9 @@ def test_legacy_json_endpoints_remain_functional(intake_client_factory):
         headers=CLINICIAN,
         json={
             "file_name": "legacy_report.pdf",
-            "pages": [{"page_number": 1, "blocks": [{"text": "SpO2: 98%"}]}],
+            "is_medical": True,
+            "document_type": "other_medical",
+            "sources": [{"text": "SpO2: 98%", "page": 1}],
         },
     )
     assert ocr_resp.status_code == 200

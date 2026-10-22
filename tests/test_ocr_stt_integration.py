@@ -1,12 +1,19 @@
 """Integration tests for OCR1 and STT_translation modules with CareFlow adapters."""
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
-from app.pipeline.normalize import InputError, adapt_ocr, adapt_stt
-from OCR1.schemas import OcrDocument, OcrPage
-from OCR1.ocr_text import ocr_document_to_text
+import OCR1.organizer as organizer
+from app.intake import process_document_locally
+from app.pipeline.normalize import (
+    InputError,
+    adapt_stt,
+    sources_from_ocr_pipeline,
+)
+from OCR1.organizer import _merge_organized_sources
 from STT_translation.schemas import (
     Language,
     SpeechTranslationInput,
@@ -14,56 +21,7 @@ from STT_translation.schemas import (
     SpeechTranslationResult,
     TranscriptChunk,
 )
-from OCR1.api import app as ocr_app
 from STT_translation.api import app as stt_app
-
-
-def test_ocr1_schemas_and_text_extraction():
-    """Verify OCR1 schemas and layout text extraction."""
-    payload = {
-        "file_name": "lab_report.pdf",
-        "page_count": 1,
-        "pages": [
-            {
-                "page_number": 1,
-                "model_output": {
-                    "res": {
-                        "parsing_res_list": [
-                            {
-                                "block_label": "text",
-                                "block_content": "Patient Name: Jane Doe",
-                                "block_order": 1,
-                                "bbox": [10, 10, 100, 20],
-                                "confidence": 0.98,
-                            },
-                            {
-                                "block_label": "table",
-                                "block_content": "Hemoglobin | 11.2 g/dL | Low",
-                                "block_order": 2,
-                                "bbox": [10, 30, 200, 80],
-                                "confidence": 0.94,
-                            },
-                            {
-                                "block_label": "image",
-                                "block_content": "binary-seal-data",
-                                "block_order": 3,
-                            },
-                        ]
-                    }
-                },
-            }
-        ],
-    }
-
-    doc = OcrDocument.model_validate(payload)
-    assert doc.file_name == "lab_report.pdf"
-    assert doc.page_count == 1
-    assert len(doc.pages) == 1
-
-    extracted_text = ocr_document_to_text(doc)
-    assert "Patient Name: Jane Doe" in extracted_text
-    assert "Hemoglobin | 11.2 g/dL | Low" in extracted_text
-    assert "binary-seal-data" not in extracted_text
 
 
 def test_stt_translation_schemas():
@@ -119,41 +77,40 @@ def test_adapt_stt_with_stt_translation_result():
     assert "fever and chills" in rec.normalized_text
 
 
-def test_adapt_ocr_with_ocr1_result():
-    """Verify CareFlow Stage A adapt_ocr seamlessly consumes OCR1 results."""
+def test_sources_from_ocr_pipeline_preserves_structured_provenance():
+    """Verify the strict organizer output maps directly to source records."""
     ocr_payload = {
+        "document_id": "doc_vitals",
         "file_name": "patient_vitals.pdf",
-        "page_count": 1,
-        "pages": [
+        "is_medical": True,
+        "document_type": "vitals_record",
+        "ocr_model": "glm-ocr",
+        "sources": [
             {
-                "page_number": 1,
-                "model_output": {
-                    "res": {
-                        "parsing_res_list": [
-                            {
-                                "block_label": "text",
-                                "block_content": "Blood Pressure: 150/95 mmHg",
-                                "block_order": 1,
-                                "bbox": [50, 50, 250, 80],
-                                "confidence": 0.96,
-                            },
-                            {
-                                "block_label": "text",
-                                "block_content": "Pulse: 104 bpm",
-                                "block_order": 2,
-                                "block_bbox": [50, 90, 200, 120],
-                            },
-                        ]
-                    }
-                },
-            }
+                "block_id": "p1_b1",
+                "text": "Blood Pressure: 150/95 mmHg",
+                "page": 1,
+                "bbox": [50, 50, 250, 80],
+                "confidence": 0.96,
+                "unreadable": False,
+            },
+            {
+                "block_id": "p1_b2",
+                "text": "Pulse: 104 bpm",
+                "page": 1,
+                "bbox": [50, 90, 200, 120],
+                "unreadable": False,
+            },
         ],
     }
 
-    records, notes = adapt_ocr(ocr_payload, case_id="case_test_ocr_001")
+    records, notes = sources_from_ocr_pipeline(
+        ocr_payload, case_id="case_test_ocr_001"
+    )
     assert not notes
     assert len(records) == 2
     assert records[0].page == 1
+    assert records[0].segment_id == "p1_b1"
     assert "Blood Pressure: 150/95 mmHg" in records[0].normalized_text
     assert records[0].confidence == 0.96
     assert records[1].page == 1
@@ -161,26 +118,235 @@ def test_adapt_ocr_with_ocr1_result():
     assert records[1].bbox == [50.0, 90.0, 200.0, 120.0]
 
 
-def test_ocr1_health_and_validation():
-    """Verify OCR1 API health endpoint and input validation."""
-    client = TestClient(ocr_app)
-    resp = client.get("/health")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+def test_organizer_filters_blocks_and_preserves_original_text():
+    """The model selects relevance, but text and page come from the OCR output."""
+    context = {
+        "file_name": "patient_lab_report.pdf",
+        "pages": [
+            {
+                "page_number": 1,
+                "blocks": [
+                    {
+                        "block_id": "p1_b1",
+                        "text": "Fasting Blood Sugar: 145 mg/dL",
+                    },
+                    {
+                        "block_id": "p1_b2",
+                        "text": "CareFlow architecture diagram",
+                    },
+                ],
+            }
+        ],
+    }
+    organized = {
+        "is_medical": True,
+        "sources": [
+            {
+                "block_id": "p1_b1",
+                "unreadable": False,
+            }
+        ],
+    }
 
-    # Unsupported extension rejection
-    bad_upload = client.post(
-        "/ocr",
-        files={"file": ("notes.txt", b"plain text is unsupported", "text/plain")},
-    )
-    assert bad_upload.status_code == 415
+    result = _merge_organized_sources(organized, context)
+    assert result["file_name"] == "patient_lab_report.pdf"
+    assert result["is_medical"] is True
+    assert result["sources"] == [
+        {
+            "block_id": "p1_b1",
+            "text": "Fasting Blood Sugar: 145 mg/dL",
+            "page": 1,
+            "unreadable": False,
+        }
+    ]
 
-    # Empty file rejection
-    empty_upload = client.post(
-        "/ocr",
-        files={"file": ("blank.pdf", b"", "application/pdf")},
+
+def test_organizer_expands_compact_range_ids():
+    """Range-compressed IDs still rebuild exact OCR text and page provenance."""
+    context = {
+        "file_name": "report.png",
+        "pages": [
+            {
+                "page_number": 1,
+                "blocks": [
+                    {"id": 1, "block_id": "p1_b1", "text": "A"},
+                    {"id": 2, "block_id": "p1_b2", "text": "B"},
+                    {"id": 3, "block_id": "p1_b3", "text": "C"},
+                    {"id": 4, "block_id": "p1_b4", "text": "D"},
+                ],
+            }
+        ],
+    }
+
+    result = _merge_organized_sources(
+        {
+            "is_medical": True,
+            "block_ids": "1-2,4",
+            "unreadable_ids": "2",
+        },
+        context,
     )
-    assert empty_upload.status_code == 400
+
+    assert [source["block_id"] for source in result["sources"]] == [
+        "p1_b1",
+        "p1_b2",
+        "p1_b4",
+    ]
+    assert result["sources"][1]["unreadable"] is True
+
+
+def test_organizer_exclusion_gate_keeps_clinical_blocks_by_default():
+    """The fast path keeps everything except explicit non-clinical ranges."""
+    context = {
+        "file_name": "report.png",
+        "pages": [
+            {
+                "page_number": 1,
+                "blocks": [
+                    {"id": 1, "block_id": "p1_b1", "text": "Hospital logo"},
+                    {"id": 2, "block_id": "p1_b2", "text": "BP: 146/92 mmHg"},
+                    {"id": 3, "block_id": "p1_b3", "text": "Troponin-I: 0.012 ng/mL"},
+                    {"id": 4, "block_id": "p1_b4", "text": "Page 1 of 1"},
+                ],
+            }
+        ],
+    }
+
+    result = _merge_organized_sources(
+        {
+            "is_medical": True,
+            "excluded_ids": "1,4",
+            "unreadable_ids": "3",
+        },
+        context,
+    )
+
+    assert [source["block_id"] for source in result["sources"]] == [
+        "p1_b2",
+        "p1_b3",
+    ]
+    assert result["sources"][1]["unreadable"] is True
+
+
+def test_organizer_marks_non_medical_documents_and_drops_sources():
+    context = {
+        "file_name": "architecture.png",
+        "pages": [
+            {
+                "page_number": 1,
+                "blocks": [
+                    {
+                        "block_id": "p1_b1",
+                        "text": "CareFlow AI architecture",
+                    }
+                ],
+            }
+        ],
+    }
+    organized = {
+        "is_medical": False,
+        "sources": [],
+    }
+
+    result = _merge_organized_sources(organized, context)
+    assert result["is_medical"] is False
+    assert result["sources"] == []
+
+
+def test_organizer_uses_ollama_format_schema_and_guardrail_prompt(monkeypatch):
+    """qwen3:8b must receive both the JSON schema and injection guardrails."""
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+
+        def json(self):
+            return {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "is_medical": True,
+                            "excluded_ids": "2",
+                            "unreadable_ids": "",
+                        }
+                    )
+                }
+            }
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr("OCR1.ollama.requests.post", fake_post)
+    ocr_result = {
+        "file_name": "lab.pdf",
+        "ocr_model": "glm-ocr",
+        "pages": [
+            {
+                "page_number": 1,
+                "blocks": [
+                    {
+                        "label": "text",
+                        "text": "Blood Pressure: 160/100 mmHg",
+                    },
+                    {
+                        "label": "text",
+                        "text": "CareFlow architecture chart",
+                    },
+                ],
+            }
+        ],
+    }
+
+    result = organizer.organize_ocr_result(
+        ocr_result, model="qwen3:8b", base_url="http://127.0.0.1:11434/api/chat"
+    )
+
+    payload = captured["payload"]
+    assert captured["url"] == "http://127.0.0.1:11434/api/chat"
+    assert payload["format"] == organizer.OUTPUT_SCHEMA
+    assert payload["format"]["properties"]["excluded_ids"] == {"type": "string"}
+    assert payload["model"] == "qwen3:8b"
+    assert payload["keep_alive"] == "30m"
+    assert payload["options"]["num_ctx"] == 8192
+    assert payload["options"]["num_predict"] <= 4096
+    assert "untrusted data" in payload["messages"][0]["content"].lower()
+    assert "non_medical" in payload["messages"][0]["content"].lower()
+    assert result["ocr_model"] == "glm-ocr"
+    assert result["sources"] == [
+        {
+            "block_id": "p1_b1",
+            "text": "Blood Pressure: 160/100 mmHg",
+            "page": 1,
+            "unreadable": False,
+        }
+    ]
+
+
+def test_document_processor_reports_organizing_stage_and_timings(monkeypatch):
+    """OCR completion is visible before the slower organizer finishes."""
+    stages = []
+
+    monkeypatch.setattr(
+        "OCR1.model.extract_document", lambda path: {"pages": []}
+    )
+    monkeypatch.setattr(
+        "OCR1.organizer.organize_ocr_result",
+        lambda ocr_result, *, model, base_url: {"is_medical": True, "sources": []},
+    )
+
+    result = process_document_locally(
+        b"image-bytes",
+        "report.png",
+        "qwen3:8b",
+        "http://127.0.0.1:11434/api/chat",
+        on_stage=stages.append,
+    )
+
+    assert stages == ["organizing"]
+    assert set(result["timings"]) == {"ocr_seconds", "organizer_seconds"}
 
 
 def test_stt_translation_health_and_validation():
@@ -207,14 +373,28 @@ def test_adapters_reject_payloads_with_no_usable_text():
     assert stt_error.value.code == "empty_transcript"
 
     with pytest.raises(InputError) as ocr_error:
-        adapt_ocr(
+        sources_from_ocr_pipeline(
             {
                 "document_id": "empty-ocr",
-                "pages": [{"page": 1, "blocks": [{"text": "\n\t"}]}],
+                "is_medical": True,
+                "document_type": "other_medical",
+                "sources": [{"text": "\n\t", "page": 1}],
             },
             case_id="case_empty_ocr",
         )
-    assert ocr_error.value.code == "empty_document"
+    assert ocr_error.value.code == "empty_medical_document"
+
+    with pytest.raises(InputError) as non_medical_error:
+        sources_from_ocr_pipeline(
+            {
+                "document_id": "non-medical",
+                "is_medical": False,
+                "document_type": "non_medical",
+                "sources": [],
+            },
+            case_id="case_non_medical",
+        )
+    assert non_medical_error.value.code == "non_medical_document"
 
 
 def test_adapt_stt_preserves_original_hindi_and_hinglish_provenance():
@@ -275,51 +455,3 @@ def test_adapt_stt_preserves_original_hindi_and_hinglish_provenance():
     assert "Mujhe two days se sudden chest pain" in h_rec.original_text
     assert h_rec.document_ref == "doc_hinglish_001"
     assert h_rec.language == "hinglish"
-
-
-def test_adapt_ocr_with_paddle_model_output():
-    """Verify adapt_ocr extracts structured blocks and bboxes directly from Paddle model_output."""
-    payload = {
-        "document_id": "doc_lab_002",
-        "file_name": "patient_lab_report.pdf",
-        "page_count": 1,
-        "pages": [
-            {
-                "page_number": 1,
-                "model_output": {
-                    "res": {
-                        "parsing_res_list": [
-                            {
-                                "block_label": "text",
-                                "block_content": "Fasting Blood Sugar: 145 mg/dL",
-                                "block_order": 1,
-                                "bbox": [15.0, 25.0, 190.0, 45.0],
-                                "confidence": 0.99,
-                            },
-                            {
-                                "block_label": "text",
-                                "block_content": "HbA1c: 7.8 % (High)",
-                                "block_order": 2,
-                                "block_bbox": [15.0, 55.0, 160.0, 75.0],
-                                "confidence": 0.98,
-                            },
-                        ]
-                    }
-                },
-            }
-        ],
-    }
-
-    records, notes = adapt_ocr(payload, case_id="case_paddle_001")
-    assert not notes
-    assert len(records) == 2
-    r0 = records[0]
-    assert r0.document_ref == "doc_lab_002"
-    assert "Fasting Blood Sugar: 145 mg/dL" in r0.original_text
-    assert r0.bbox == [15.0, 25.0, 190.0, 45.0]
-    assert r0.page == 1
-
-    r1 = records[1]
-    assert "HbA1c: 7.8 %" in r1.original_text
-    assert r1.bbox == [15.0, 55.0, 160.0, 75.0]
-

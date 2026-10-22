@@ -3,10 +3,10 @@
 CareFlow's web audio intake calls the in-repo Sarvam implementation
 (`STT_translation.stt.speech_to_language`) directly in a background worker; no
 separate STT server is required. The independent `/speech-to-language` endpoint
-described above remains available for external integrations. Text from other
-upstream components can still be supplied through the JSON adapters
-(`/sources/stt`, `/sources/ocr`, `/sources/message`) to preserve provenance.
-Uploaded audio/PDF/images are stored encrypted as originals.
+described above remains available for external integrations. Text from approved
+upstream components can still be supplied through the structured ingestion
+endpoints (`/sources/stt`, `/sources/ocr`, `/sources/message`) to preserve
+provenance. Uploaded audio/PDF/images are stored encrypted as originals.
 
 Endpoints:
 
@@ -16,7 +16,11 @@ Endpoints:
 
 Consent is required. Ingesting the same payload twice is idempotent: stable source IDs are reported under `duplicates` instead of creating duplicate sources.
 
-The standalone STT/OCR service outputs can be posted directly to CareFlow: STT results are read from `chunks`/`transcription` with `start_seconds`/`end_seconds`, and OCR results are read from `pages[].model_output.parsing_res_list` with `block_content`/`block_bbox`.
+CareFlow's document intake runs `OCR1.model.extract_document()` and
+`OCR1.organizer.organize_ocr_result()` in-process and persists the organizer's
+structured output; no OCR HTTP service is called. External OCR callers can use
+`/sources/ocr` with the structured source contract below. STT results are read
+from `chunks`/`transcription` with `start_seconds`/`end_seconds`.
 
 ## STT payload
 
@@ -53,43 +57,55 @@ Mapping:
 
 ## OCR payload
 
+Direct document intake no longer accepts vendor OCR layouts or calls an OCR
+microservice. `OCR1.organizer.organize_ocr_result()` returns `file_name`,
+`ocr_model`, `is_medical`, and `sources`. CareFlow adds `document_id` before
+persistence. `/sources/ocr` also accepts optional `language`, `document_id`,
+and `document_type` fields, as shown below:
+
 ```json
 {
   "document_id": "lab-2026-10-20",
   "file_name": "report.pdf",
   "language": "en",
-  "model": "your-ocr-model",
-  "pages": [
+  "ocr_model": "glm-ocr",
+  "is_medical": true,
+  "document_type": "lab_report",
+  "sources": [
     {
+      "block_id": "p1_b1",
+      "text": "Temperature 101.5 F.",
       "page": 1,
-      "confidence": 0.93,
-      "blocks": [
-        {
-          "text": "Temperature 101.5 F.",
-          "bbox": [10, 20, 300, 42],
-          "confidence": 0.95,
-          "unreadable": false
-        },
-        {
-          "text": "SpO2 ___ %",
-          "bbox": [10, 50, 300, 72],
-          "confidence": 0.31,
-          "unreadable": true
-        }
-      ]
+      "unreadable": false
+    },
+    {
+      "block_id": "p1_b2",
+      "text": "SpO2 ___ %",
+      "page": 1,
+      "unreadable": true
     }
   ]
 }
 ```
 
-Accepted aliases: `results` for `pages`; `lines` for `blocks`; `page_number` for `page`; `box` for `bbox`; top-level `text` for a single block; `filename` for `file_name`; `processed_at` for `captured_at`.
+GLM-OCR does not supply bounding boxes or confidence scores, so those fields
+are absent from the in-process OCR output. External callers of `/sources/ocr`
+may still include optional `bbox` and `confidence` fields for each source.
+
+The organizer decides medical relevance and only emits medically relevant
+sources. It uses a compact exclusion gate: the model returns ranges of
+non-clinical blocks to drop, while all remaining OCR blocks are kept by
+default. This reduces organizer latency without letting the model rewrite or
+invent source text. If `is_medical` is false, the payload is rejected with
+`non_medical_document` and nothing is persisted.
 
 Mapping:
 
-- Each block becomes a separate source with `page`, `bbox`, confidence and stable ID.
+- Each selected source becomes a separate `SourceRecord` with `page`, optional `bbox`/confidence and stable ID.
 - `unreadable: true` adds `unreadable_critical_field`, which forces `critical_failure` and prevents a routine outcome.
 - Low confidence adds `low_source_confidence`; the extractor additionally caps confidence and marks `low_extraction_confidence`.
 - `document_id`/`file_name` is preserved as a document reference. It is not the same as an encrypted upload ID.
+- Prompt-injection indicators in the original text add `prompt_injection_suspected:*` warnings; they never alter rules or triage.
 
 ## Typed message payload
 

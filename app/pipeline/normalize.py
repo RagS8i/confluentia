@@ -1,9 +1,11 @@
-"""Stage A - input normalization and STT/OCR adapters.
+"""Stage A - input normalization, STT adapter, and structured OCR mapping.
 
-The adapters accept the vendor payloads *as delivered* and preserve every
-provenance field available (timestamps, pages, bounding boxes, confidences,
-document identifiers, language metadata).  Original text is never overwritten
-by the normalized representation.
+The STT adapter accepts the vendor payload as delivered. OCR no longer accepts
+arbitrary vendor layouts: the in-process organizer emits a strict source-level
+contract, and ``sources_from_ocr_pipeline`` maps that to persistence records.
+Both paths preserve provenance (timestamps, pages, optional bounding boxes
+and confidences, document identifiers and language metadata), and original text
+is never overwritten by the normalized representation.
 """
 from __future__ import annotations
 
@@ -312,15 +314,30 @@ def adapt_stt(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
     return records, notes
 
 
-def adapt_ocr(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord], List[str]]:
+def sources_from_ocr_pipeline(
+    payload: Dict[str, Any], case_id: str
+) -> Tuple[List[SourceRecord], List[str]]:
+    """Convert the organizer's structured OCR output into source records.
+
+    The OCR pipeline has already filtered non-medical/unrequired blocks and
+    supplied exact text, page and bbox provenance. This function only performs
+    the deterministic persistence mapping; it does not parse vendor layouts or
+    accept an arbitrary OCR payload.
+    """
     if not isinstance(payload, dict):
         raise InputError("malformed_payload", "OCR payload must be a JSON object")
-    pages = payload.get("pages") or payload.get("results") or []
-    top_text = payload.get("text")
-    if not pages and not top_text:
-        raise InputError("empty_document", "OCR payload contains no text")
-    if pages and not isinstance(pages, list):
-        raise InputError("malformed_payload", "OCR pages must be a list")
+    if payload.get("is_medical") is not True:
+        raise InputError(
+            "non_medical_document",
+            "The uploaded document does not contain clinically relevant content",
+        )
+
+    blocks = payload.get("sources")
+    if not isinstance(blocks, list) or not blocks:
+        raise InputError(
+            "empty_medical_document",
+            "The OCR pipeline found no medically relevant source text",
+        )
 
     declared = payload.get("language") or payload.get("language_code")
     status = payload.get("language_status")
@@ -331,118 +348,68 @@ def adapt_ocr(payload: Dict[str, Any], case_id: str) -> Tuple[List[SourceRecord]
         or payload.get("filename")
         or payload.get("id")
     )
-    base = _base_id(payload, str(top_text or ""), "ocr")
+    base = _base_id(payload, "", "ocr")
     parent = f"ocr:{case_id[:10]}:{base}"
     notes: List[str] = []
     records: List[SourceRecord] = []
 
-    def add(
-        text: str,
-        page_no: Optional[int],
-        bbox: Optional[List[float]],
-        confidence: Optional[float],
-        index: int,
-        block_meta: Optional[Dict[str, Any]] = None,
-    ):
-        original = str(text or "")
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            notes.append(f"source_{index}_invalid")
+            continue
+
+        original = block.get("text") or ""
+        if not isinstance(original, str):
+            original = str(original)
         normalized = normalize_text(original)
         if not normalized:
-            return
+            notes.append(f"source_{index}_empty")
+            continue
+
+        page_raw = block.get("page", block.get("page_number"))
+        try:
+            page_no = int(page_raw) if page_raw is not None else None
+        except (TypeError, ValueError):
+            page_no = None
+
+        block_id = block.get("block_id")
+        segment_id = str(block_id) if block_id else f"p{page_no or 0}-b{index}"
+
         records.append(
             _build_source(
                 case_id=case_id,
                 modality=Modality.ocr,
                 source_id=_segment_source_id("ocr", case_id, base, index),
-                segment_id=f"p{page_no or 0}-b{index}",
+                segment_id=segment_id,
                 original=original,
                 normalized=normalized,
                 declared_language=declared,
                 source_language_status=status,
-                confidence=confidence,
+                confidence=_norm_confidence(block.get("confidence")),
                 document_ref=str(doc_ref) if doc_ref else None,
                 page=page_no,
-                bbox=bbox,
+                bbox=_bbox(block.get("bbox") or block.get("box")),
                 audio_start=None,
                 audio_end=None,
                 captured_at=captured,
                 parent_source_id=parent,
                 extra_warnings=(
-                    ["unreadable_critical_field"]
-                    if (block_meta or {}).get("unreadable")
-                    else None
+                    ["unreadable_critical_field"] if block.get("unreadable") else None
                 ),
                 raw_metadata={
                     "document_id": payload.get("document_id") or payload.get("id"),
                     "file_name": payload.get("file_name") or payload.get("filename"),
                     "ocr_model": payload.get("model") or payload.get("ocr_model"),
-                    "block": block_meta or {},
+                    "document_type": payload.get("document_type"),
+                    "block": block,
                 },
             )
         )
 
-    index = 0
-    if pages:
-        for page_index, page in enumerate(pages):
-            if not isinstance(page, dict):
-                notes.append(f"page_{page_index}_invalid")
-                continue
-            page_no = page.get("page", page.get("page_number", page_index + 1))
-            try:
-                page_no = int(page_no)
-            except (TypeError, ValueError):
-                page_no = page_index + 1
-            page_conf = _norm_confidence(page.get("confidence"))
-            blocks = page.get("blocks") or page.get("lines") or []
-            if not blocks and "model_output" in page and isinstance(page["model_output"], dict):
-                try:
-                    from OCR1.ocr_text import _block_order, _blocks, _page_text, _text_from_block
-
-                    p_blocks = _blocks(page["model_output"])
-                    if p_blocks:
-                        ordered = sorted(p_blocks, key=_block_order)
-                        for pb in ordered:
-                            t = _text_from_block(pb)
-                            if t:
-                                blocks.append({
-                                    "text": t,
-                                    "bbox": pb.get("bbox") or pb.get("box") or pb.get("block_bbox"),
-                                    "confidence": _norm_confidence(pb.get("confidence") or pb.get("score")),
-                                    "label": pb.get("block_label"),
-                                })
-                    if not blocks:
-                        for t in _page_text(page["model_output"]):
-                            blocks.append({"text": t, "confidence": page_conf})
-                except Exception:
-                    pass
-            if blocks and isinstance(blocks, list):
-                for block in blocks:
-                    if not isinstance(block, dict):
-                        notes.append(f"page_{page_no}_block_invalid")
-                        continue
-                    add(
-                        block.get("text") or "",
-                        page_no,
-                        _bbox(block.get("bbox") or block.get("box")),
-                        _norm_confidence(block.get("confidence", page_conf)),
-                        index,
-                        block,
-                    )
-                    index += 1
-            else:
-                add(
-                    page.get("text") or "",
-                    page_no,
-                    _bbox(page.get("bbox")),
-                    page_conf,
-                    index,
-                )
-                index += 1
-    else:
-        add(str(top_text), 1, None, _norm_confidence(payload.get("confidence")), 0)
-
     if not records:
         raise InputError(
-            "empty_document", "OCR payload contains no usable document text"
+            "empty_medical_document",
+            "The OCR pipeline found no usable medically relevant text",
         )
     return records, notes
 

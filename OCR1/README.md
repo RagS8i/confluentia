@@ -1,90 +1,87 @@
-# Careflow OCR service
+# Careflow OCR
 
-FastAPI wrapper around the PaddleOCR-VL pipeline in `model.py`.
+OCR pipeline for CareFlow document intake, backed by **GLM-OCR** served by a
+local [Ollama](https://ollama.com/) instance. `model.py` extracts text from each
+page; `organizer.py` performs the clinical-relevance pass afterwards.
 
-The orchestrator calls `POST /ocr` over HTTP. The service is also independently
-callable. See the root `README.md` for the complete Careflow architecture.
+CareFlow's document intake runs both steps in-process from
+`app/intake.py`. There is no OCR HTTP service.
 
 ## Install
 
-```sh
-pip install -r OCR1/requirements.txt
-```
-
-On Linux with an NVIDIA GPU, replace `paddlepaddle` with the matching
-`paddlepaddle-gpu` build for your CUDA version. PaddleOCR-VL weights are
-downloaded to `PADDLE_PDX_CACHE_HOME` (default `~/.paddlex/official_models`) on
-first use.
-
-## Run
-
-From the repository root:
+Install the repository dependencies, then install Ollama and pull the OCR model:
 
 ```sh
-uvicorn OCR1.api:app --host 127.0.0.1 --port 8002 --reload
+pip install -r requirements.txt
+ollama pull glm-ocr
+ollama serve
 ```
 
-Or from inside the folder:
+The default Ollama endpoint is `http://127.0.0.1:11434`. It can be changed with:
 
-```sh
-cd OCR1
-uvicorn api:app --port 8002 --reload
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CAREFLOW_OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama base URL |
+| `CAREFLOW_OLLAMA_MODEL` | `qwen3:8b` | Ollama text model used by the organizer |
+| `CAREFLOW_OCR_MODEL` | `glm-ocr` | Ollama vision model used for OCR |
+| `CAREFLOW_OCR_TIMEOUT_S` | `300` | Per-page OCR request timeout |
+
+The model is loaded lazily by Ollama on the first page. No separate OCR model
+weights are downloaded by this repository.
+
+## Usage
+
+```python
+from OCR1.model import extract_document
+from OCR1.organizer import organize_ocr_result
+
+ocr_output = extract_document("scan.pdf")
+result = organize_ocr_result(ocr_output)
 ```
 
-## Endpoints
-
-### `GET /health`
-
-```json
-{"status": "ok"}
-```
-
-### `POST /ocr`
-
-Multipart upload with a single `file` field. Supported extensions:
-
-```
-.pdf .png .jpg .jpeg .webp .bmp .tif .tiff
-```
-
-```sh
-curl -X POST http://127.0.0.1:8002/ocr \
-  -F "file=@scan.pdf"
-```
-
-Response:
+### Extraction output
 
 ```json
 {
-  "file_name": "upload.pdf",
+  "file_name": "scan.pdf",
+  "ocr_model": "glm-ocr",
   "page_count": 1,
   "pages": [
     {
       "page_number": 1,
-      "model_output": {
-        "res": {
-          "parsing_res_list": [
-            {
-              "block_label": "text",
-              "block_content": "Hemoglobin: 12.5 g/dL",
-              "block_order": 1
-            }
-          ]
-        }
-      }
+      "blocks": [
+        {"label": "text", "text": "Hemoglobin: 12.5 g/dL"}
+      ]
     }
   ]
 }
 ```
 
-PaddleX layout blocks are normalized with `to_dict()` so `block_content` is
-real text rather than an object repr. The orchestrator's `ocr_text.py` extracts
-those blocks in reading order and falls back to `overall_ocr_res.rec_texts`.
+GLM-OCR returns text but no pixel-accurate bounding boxes or confidence scores,
+so blocks contain only a label and text.
 
-Errors:
+### Organizer output
 
-| Status | Meaning |
-| --- | --- |
-| 400 | The uploaded file is empty |
-| 415 | Extension is not in `SUPPORTED_EXTENSIONS` |
-| 500 | OCR extraction failed (details are logged server-side) |
+```json
+{
+  "file_name": "scan.pdf",
+  "ocr_model": "glm-ocr",
+  "is_medical": true,
+  "sources": [
+    {
+      "block_id": "p1_b1",
+      "text": "Hemoglobin: 12.5 g/dL",
+      "page": 1,
+      "unreadable": false
+    }
+  ]
+}
+```
+
+The organizer uses a compact exclusion gate: it returns numeric ID ranges for
+non-clinical blocks and flags unreadable kept blocks. The caller keeps every
+remaining OCR block and rebuilds each source's text and page from the extraction
+output, so the model cannot change provenance. Keeping clinical content by
+default also makes the organizer response much shorter and faster.
+
+Supported extensions: `.pdf .png .jpg .jpeg .webp .bmp .tif .tiff`

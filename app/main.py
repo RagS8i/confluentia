@@ -26,6 +26,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from OCR1.model import SUPPORTED_EXTENSIONS
+
 from .communications import (
     SUPPORTED_MESSAGE_LANGUAGES,
     CommunicationError,
@@ -36,9 +38,19 @@ from .db import Database
 from .deletion import DeletionService
 from .escalation import EscalationError, EscalationService
 from .followups import FollowUpError, FollowUpService
-from .intake import IntakeService, OcrClient, SttService, persist_sources
+from .intake import (
+    DocumentProcessor,
+    IntakeService,
+    SttService,
+    persist_sources,
+)
 from .model.provider import BaseProvider, build_provider
-from .pipeline.normalize import InputError, adapt_ocr, adapt_stt, adapt_typed
+from .pipeline.normalize import (
+    InputError,
+    adapt_stt,
+    adapt_typed,
+    sources_from_ocr_pipeline,
+)
 from .pipeline.orchestrator import (
     CaseUnavailable,
     ConsentRequired,
@@ -667,7 +679,7 @@ def ingest_ocr(
     ensure_roles(principal, {"patient", "intake", "clinician", "admin"})
     case = _load_case(request, case_id, principal)
     try:
-        sources, notes = adapt_ocr(payload, case_id)
+        sources, notes = sources_from_ocr_pipeline(payload, case_id)
     except InputError as exc:
         _db(request).audit(principal.user_id, principal.role, "ocr_ingest_rejected", case_id, {"code": exc.code})
         raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message})
@@ -786,9 +798,9 @@ ALLOWED_AUDIO_MIMES = {
     "audio/flac", "audio/x-flac", "audio/webm", "audio/aac", "application/octet-stream"
 }
 
-ALLOWED_DOC_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif"}
 ALLOWED_DOC_MIMES = {
-    "application/pdf", "image/png", "image/jpeg", "image/webp", "image/tiff"
+    "application/pdf", "image/png", "image/jpeg", "image/webp", "image/bmp",
+    "image/tiff"
 }
 
 
@@ -894,9 +906,9 @@ async def intake_document(
     ext = Path(filename).suffix.lower()
     raw_mime = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
 
-    if raw_mime not in ALLOWED_DOC_MIMES and ext not in ALLOWED_DOC_EXTENSIONS:
+    if raw_mime not in ALLOWED_DOC_MIMES and ext not in SUPPORTED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="unsupported document content type")
-    if ext and ext not in ALLOWED_DOC_EXTENSIONS:
+    if ext and ext not in SUPPORTED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="unsupported document file extension")
 
     content = await file.read(settings.max_upload_bytes + 1)
@@ -1653,7 +1665,7 @@ def create_app(
     provider: Optional[BaseProvider] = None,
     engine: Optional[RuleEngine] = None,
     stt_service: Optional[SttService] = None,
-    ocr_client: Optional[OcrClient] = None,
+    document_processor: Optional[DocumentProcessor] = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     cipher = Cipher(settings)
@@ -1684,7 +1696,7 @@ def create_app(
         documents=documents,
         pipeline=pipeline,
         stt_service=stt_service,
-        ocr_client=ocr_client,
+        document_processor=document_processor,
     )
 
     @asynccontextmanager
