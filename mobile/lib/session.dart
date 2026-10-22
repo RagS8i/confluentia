@@ -20,7 +20,14 @@ class CareFlowSession extends ChangeNotifier {
   String role;
   String patientId;
 
-  bool get isStaff => role == 'clinician' || role == 'admin';
+  bool get isStaff =>
+      role == 'clinician' ||
+      role == 'doctor' ||
+      role == 'nurse' ||
+      role == 'physician' ||
+      role == 'physician_assistant' ||
+      role == 'nurse_practitioner' ||
+      role == 'admin';
   bool get isPatient => role == 'patient';
   bool get canViewIntelligence => isStaff || role == 'intake';
 

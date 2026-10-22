@@ -136,6 +136,8 @@ class QueueOperationsService:
             assigned_reviewer=case.assigned_reviewer,
             review_status=review_status,
             consent=consent,
+            urgency_score=case.urgency.score if case.urgency else None,
+            urgency_source=case.urgency.source.value if case.urgency else None,
         )
         extra = {"warnings": warnings, "deadline": deadline}
         return item, extra
@@ -165,6 +167,11 @@ class QueueOperationsService:
             explanations.append("No clinician is assigned.")
         if item.awaiting_minutes:
             factors["waiting_time"] = float(min(15, item.awaiting_minutes / 30.0))
+        if item.urgency_score is not None:
+            explanations.append(
+                f"Advisory urgency {item.urgency_score}/100 "
+                f"({item.urgency_source or 'unknown'}); a clinician can edit it."
+            )
         if not explanations:
             explanations.append("Routine prioritization within the existing workflow category.")
         return round(sum(factors.values()), 2), factors, explanations
@@ -269,6 +276,8 @@ class QueueOperationsService:
                     awaiting_minutes=item.awaiting_minutes,
                     overdue=item.overdue,
                     priority_rank=priority_rank,
+                    urgency_score=item.urgency_score,
+                    urgency_source=item.urgency_source,
                     score=score,
                     factors=factors,
                     explanations=explanations,
@@ -283,6 +292,7 @@ class QueueOperationsService:
         recommendations.sort(
             key=lambda entry: (
                 entry.priority_rank,
+                -(entry.urgency_score if entry.urgency_score is not None else -1),
                 -entry.score,
                 entry.received_at,
             )

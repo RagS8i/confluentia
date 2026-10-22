@@ -36,6 +36,9 @@ class CareFlowApi {
   Future<dynamic> put(String path, {Object? body}) =>
       _request('PUT', path, body: body);
 
+  Future<dynamic> patch(String path, {Object? body}) =>
+      _request('PATCH', path, body: body);
+
   Future<dynamic> _request(
     String method,
     String path, {

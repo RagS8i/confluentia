@@ -93,7 +93,15 @@ function notify(message, isError) {
 }
 
 function roleCanReview() {
-  return ["clinician", "admin"].includes(state.identity.role);
+  return [
+    "clinician",
+    "doctor",
+    "nurse",
+    "physician",
+    "physician_assistant",
+    "nurse_practitioner",
+    "admin",
+  ].includes(state.identity.role);
 }
 
 function saveIdentity() {
@@ -126,6 +134,7 @@ async function loadQueue() {
       if (item.contradiction_count) flags.push(`${item.contradiction_count} discrepancy(ies)`);
       if (item.missing_info_count) flags.push(`${item.missing_info_count} gap(s)`);
       if (item.processing_failures) flags.push(`${item.processing_failures} failure(s)`);
+      if (item.urgency_score != null) flags.unshift(`urgency ${item.urgency_score}/100`);
       return `
         <div class="queue-item ${escapeHtml(item.workflow_status)} ${item.case_id === state.caseId ? "active" : ""}"
              data-case="${escapeHtml(item.case_id)}">
@@ -209,7 +218,7 @@ function renderRecommendations(items) {
       <div class="recommendation" data-case="${escapeHtml(item.case_id)}">
         <div class="recommendation-head">
           <div>${badge(item.workflow_status)} <span class="badge">${escapeHtml(item.case_id)}</span></div>
-          <span class="score">score ${Number(item.score || 0).toFixed(1)}</span>
+          <span class="score">${item.urgency_score != null ? `urgency ${item.urgency_score}/100 · ` : ""}score ${Number(item.score || 0).toFixed(1)}</span>
         </div>
         <div class="action">${escapeHtml(item.recommended_action)}</div>
         <div class="qmeta small-text">${escapeHtml(estimate)}${item.overdue ? " · deadline passed" : ""}</div>
@@ -295,12 +304,28 @@ function renderCase(data) {
     <span class="badge">model: ${escapeHtml(meta.provider || "n/a")} / ${escapeHtml(meta.model || "n/a")}</span>
     <span class="badge">facts: ${meta.fact_count != null ? meta.fact_count : "0"}</span>
     <span class="badge">sources: ${meta.usable_source_count != null ? meta.usable_source_count : "0"}</span>
+    <span class="badge">urgency: ${c.urgency ? `${c.urgency.score}/100 ${c.urgency.source}` : "not assessed"}</span>
     ${deadline != null ? `<span class="badge">review deadline: ${deadline} min</span>` : ""}
     <span class="badge">${escapeHtml(estimateText)}</span>
     ${failures ? `<span class="badge EMERGENCY">${failures} processing failure(s)</span>` : ""}
     ${meta.summary_stale ? '<span class="badge PRIORITY_REVIEW">summary stale after correction</span>' : ""}
     <span class="badge">${escapeHtml(meta.rule_config_status || "illustrative")}</span>
   `;
+  const urgency = c.urgency;
+  const canEditUrgency = roleCanReview() && !c.consent_withdrawn_at && !c.deleted_at;
+  $("urgency-score").textContent = urgency ? `${urgency.score}/100` : "not assessed";
+  $("urgency-meta").textContent = urgency
+    ? `Source: ${urgency.source}${urgency.model ? " · model " + urgency.model : ""}` +
+      `${urgency.assessed_at ? " · assessed " + new Date(urgency.assessed_at).toLocaleString() : ""}` +
+      `${urgency.edited_by ? " · edited by " + urgency.edited_by : ""}` +
+      `${urgency.edit_reason ? " · reason: " + urgency.edit_reason : ""}`
+    : "Run processing to generate an advisory SLM assessment.";
+  $("urgency-rationale").textContent = urgency ? urgency.rationale : "";
+  $("urgency-input").value = urgency ? urgency.score : "";
+  $("urgency-input").disabled = !canEditUrgency;
+  $("urgency-reason").disabled = !canEditUrgency;
+  $("save-urgency").disabled = !canEditUrgency;
+
   $("consent-btn").disabled = Boolean(c.consent_withdrawn_at || c.deleted_at);
   $("process-btn").disabled = Boolean(c.consent_withdrawn_at || c.deleted_at);
   $("assign-btn").disabled = !roleCanReview();
@@ -1094,6 +1119,31 @@ async function overrideStatus() {
   } catch (error) { notify(error.message, true); }
 }
 
+async function saveUrgency() {
+  if (!state.caseId) return;
+  const score = Number($("urgency-input").value);
+  if (!Number.isInteger(score) || score < 0 || score > 100) {
+    notify("Urgency must be a whole number from 0 to 100.", true);
+    return;
+  }
+  const reason = $("urgency-reason").value.trim();
+  if (reason.length < 3) {
+    notify("A documented reason is required to edit urgency.", true);
+    return;
+  }
+  if (!confirm("Update this advisory urgency score? Your identity, role, timestamp and reason will be recorded. The workflow category will not change.")) return;
+  try {
+    await api(`/cases/${encodeURIComponent(state.caseId)}/urgency`, {
+      method: "PATCH",
+      body: { score, reason, confirmed: true },
+    });
+    $("urgency-reason").value = "";
+    notify("Urgency score updated with an audit record.");
+    await loadCase(state.caseId);
+    await loadIntelligence();
+  } catch (error) { notify(error.message, true); }
+}
+
 async function assignCase() {
   if (!state.caseId) return;
   const reviewer = window.prompt("Assign this case to a clinician (user ID):", state.caseData?.case?.assigned_reviewer || "");
@@ -1305,6 +1355,7 @@ function wire() {
   $("copy-case-link").addEventListener("click", copyCaseLink);
   $("refresh-case").addEventListener("click", () => { if (state.caseId) loadCase(state.caseId); });
   $("assign-btn").addEventListener("click", assignCase);
+  $("save-urgency").addEventListener("click", saveUrgency);
   $("consent-btn").addEventListener("click", grantConsent);
   $("process-btn").addEventListener("click", processCase);
   $("withdraw-btn").addEventListener("click", withdrawConsent);

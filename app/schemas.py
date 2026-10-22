@@ -134,6 +134,7 @@ class ReviewerAction(str, Enum):
     edit_note = "edit_note"
     override_status = "override_status"
     assign = "assign"
+    edit_urgency = "edit_urgency"
     acknowledge_warning = "acknowledge_warning"
 
 
@@ -433,6 +434,42 @@ class ClinicalSummary(BaseModel):
     disclaimers: List[str] = Field(default_factory=list)
 
 
+class UrgencySource(str, Enum):
+    slm = "slm"
+    clinician = "clinician"
+    fallback = "fallback"
+
+
+class UrgencyEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    score: int = Field(ge=0, le=100)
+    previous_score: Optional[int] = Field(default=None, ge=0, le=100)
+    edited_by: str
+    role: str
+    reason: str
+    edited_at: datetime = Field(default_factory=utcnow)
+
+
+class UrgencyAssessment(BaseModel):
+    """Advisory 0-100 urgency. Never a diagnosis, clearance or workflow status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: int = Field(ge=0, le=100)
+    rationale: str = Field(default="", max_length=1000)
+    source: UrgencySource = UrgencySource.slm
+    model: Optional[str] = None
+    assessed_at: datetime = Field(default_factory=utcnow)
+    assessed_by: Optional[str] = None
+    slm_score: Optional[int] = Field(default=None, ge=0, le=100)
+    edited_by: Optional[str] = None
+    edited_at: Optional[datetime] = None
+    edit_reason: Optional[str] = None
+    model_error: Optional[str] = None
+    history: List[UrgencyEdit] = Field(default_factory=list)
+
+
 class CaseRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -449,6 +486,7 @@ class CaseRecord(BaseModel):
     deleted_at: Optional[datetime] = None
     language_hint: Optional[str] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
+    urgency: Optional[UrgencyAssessment] = None
 
     @property
     def consent_granted(self) -> bool:
@@ -507,6 +545,8 @@ class QueueItem(BaseModel):
     assigned_reviewer: Optional[str] = None
     review_status: str = "pending"
     consent: str = "unknown"
+    urgency_score: Optional[int] = None
+    urgency_source: Optional[str] = None
 
 
 class PatientMessage(BaseModel):
@@ -629,6 +669,8 @@ class QueueRecommendation(BaseModel):
     awaiting_minutes: Optional[int] = None
     overdue: bool = False
     priority_rank: int
+    urgency_score: Optional[int] = None
+    urgency_source: Optional[str] = None
     score: float
     factors: Dict[str, float] = Field(default_factory=dict)
     explanations: List[str] = Field(default_factory=list)

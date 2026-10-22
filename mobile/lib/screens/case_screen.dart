@@ -164,6 +164,101 @@ class _CaseScreenState extends State<CaseScreen> {
     );
   }
 
+  Future<void> _editUrgency() async {
+    final urgency = _detail?.urgency;
+    final scoreController = TextEditingController(
+      text: urgency == null ? '' : '${urgency.score}',
+    );
+    final reasonController = TextEditingController();
+    final rationaleController = TextEditingController(
+      text: urgency?.rationale ?? '',
+    );
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Edit advisory urgency'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'The SLM score is advisory. Editing it does not change the '
+                'workflow category and is fully audited.',
+                style: TextStyle(fontSize: 12, color: Color(0xFF647A86)),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: scoreController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Urgency score (0-100)',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: reasonController,
+                decoration: const InputDecoration(
+                  labelText: 'Reason for change (required)',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: rationaleController,
+                minLines: 2,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  labelText: 'Clinical rationale (optional)',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Confirm'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final score = int.tryParse(scoreController.text.trim());
+    if (score == null || score < 0 || score > 100) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Urgency must be a whole number from 0 to 100.'),
+        ),
+      );
+      return;
+    }
+    final reason = reasonController.text.trim();
+    if (reason.length < 3) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('A documented reason is required.')),
+      );
+      return;
+    }
+    final rationale = rationaleController.text.trim();
+    await _run(
+      () => widget.api.patch(
+        '/api/cases/${widget.caseId}/urgency',
+        body: {
+          'score': score,
+          'reason': reason,
+          'rationale': rationale.isEmpty ? null : rationale,
+          'confirmed': true,
+        },
+      ),
+      'Urgency score updated.',
+    );
+  }
+
   Future<void> _override() async {
     final reason = await _askText(
       title: 'Override triage outcome',
@@ -503,6 +598,8 @@ class _CaseScreenState extends State<CaseScreen> {
             onAssign: _assign,
             onOverride: _override,
           ),
+          const SizedBox(height: 12),
+          _urgencyCard(detail),
           if (detail.escalations.isNotEmpty) ...[
             const SizedBox(height: 12),
             _escalationsCard(detail),
@@ -594,6 +691,57 @@ class _CaseScreenState extends State<CaseScreen> {
             ),
           );
         }).toList(),
+      ),
+    );
+  }
+
+  Widget _urgencyCard(CaseDetail detail) {
+    final urgency = detail.urgency;
+    return SectionCard(
+      eyebrow: 'Advisory urgency · 0-100',
+      title: 'Patient urgency',
+      trailing: StatusChip(
+        urgency == null ? 'not assessed' : '${urgency.score}/100',
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (urgency == null)
+            const Text(
+              'Run processing to generate an advisory SLM assessment. '
+              'The score never replaces clinician review or the workflow category.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF647A86)),
+            )
+          else ...[
+            Text(urgency.rationale, style: const TextStyle(fontSize: 12.5)),
+            const SizedBox(height: 6),
+            Text(
+              'Source: ${urgency.source}'
+              '${urgency.model != null ? ' · model ${urgency.model}' : ''}'
+              '${urgency.assessedAt != null ? ' · assessed ${formatTime(urgency.assessedAt!.toIso8601String())}' : ''}'
+              '${urgency.editedBy != null ? ' · edited by ${urgency.editedBy}' : ''}',
+              style: const TextStyle(fontSize: 10.5, color: Color(0xFF647A86)),
+            ),
+            if (urgency.editReason != null && urgency.editReason!.isNotEmpty)
+              Text(
+                'Edit reason: ${urgency.editReason}',
+                style: const TextStyle(
+                  fontSize: 10.5,
+                  color: Color(0xFF647A86),
+                ),
+              ),
+          ],
+          if (_staff &&
+              detail.status != 'withdrawn' &&
+              detail.status != 'deleted') ...[
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: _busy ? null : _editUrgency,
+              icon: const Icon(Icons.tune, size: 16),
+              label: const Text('Edit urgency'),
+            ),
+          ],
+        ],
       ),
     );
   }

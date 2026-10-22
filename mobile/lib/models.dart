@@ -104,6 +104,42 @@ class WaitEstimate {
       : 'Unavailable until staffing and sample data exist';
 }
 
+class UrgencyAssessment {
+  UrgencyAssessment({
+    required this.score,
+    required this.rationale,
+    required this.source,
+    this.model,
+    this.assessedAt,
+    this.slmScore,
+    this.editedBy,
+    this.editReason,
+  });
+
+  final int score;
+  final String rationale;
+  final String source;
+  final String? model;
+  final DateTime? assessedAt;
+  final int? slmScore;
+  final String? editedBy;
+  final String? editReason;
+
+  factory UrgencyAssessment.fromJson(dynamic json) {
+    final map = mapValue(json);
+    return UrgencyAssessment(
+      score: intValue(map['score']),
+      rationale: textValue(map['rationale']),
+      source: textValue(map['source'], 'unknown'),
+      model: map['model']?.toString(),
+      assessedAt: DateTime.tryParse(textValue(map['assessed_at'])),
+      slmScore: map['slm_score'] == null ? null : intValue(map['slm_score']),
+      editedBy: map['edited_by']?.toString(),
+      editReason: map['edit_reason']?.toString(),
+    );
+  }
+}
+
 class Bottlenecks {
   Bottlenecks({
     this.totalWaiting = 0,
@@ -163,6 +199,8 @@ class QueueRecommendation {
     required this.overdue,
     this.awaitingMinutes,
     this.waitEstimate,
+    this.urgencyScore,
+    this.urgencySource,
   });
 
   final String caseId;
@@ -178,6 +216,8 @@ class QueueRecommendation {
   final bool overdue;
   final int? awaitingMinutes;
   final WaitEstimate? waitEstimate;
+  final int? urgencyScore;
+  final String? urgencySource;
 
   factory QueueRecommendation.fromJson(Map<String, dynamic> json) {
     final factors = <String, double>{};
@@ -207,6 +247,10 @@ class QueueRecommendation {
       waitEstimate: json['wait_estimate'] == null
           ? null
           : WaitEstimate.fromJson(json['wait_estimate']),
+      urgencyScore: json['urgency_score'] == null
+          ? null
+          : intValue(json['urgency_score']),
+      urgencySource: json['urgency_source']?.toString(),
     );
   }
 }
@@ -227,9 +271,9 @@ class QueueIntelligence {
   factory QueueIntelligence.fromJson(dynamic json) {
     final map = mapValue(json);
     return QueueIntelligence(
-      items: mapList(
-        map['items'],
-      ).map(QueueRecommendation.fromJson).toList(growable: false),
+      items: mapList(map['items'])
+          .map(QueueRecommendation.fromJson)
+          .toList(growable: false),
       bottlenecks: Bottlenecks.fromJson(map['bottlenecks']),
       staffing: Staffing.fromJson(map['staffing']),
       disclaimer: textValue(map['disclaimer']),
@@ -381,6 +425,7 @@ class CaseDetail {
     required this.summary,
     required this.sources,
     required this.queueEstimate,
+    this.urgency,
   });
 
   final String caseId;
@@ -397,6 +442,7 @@ class CaseDetail {
   final Map<String, dynamic> summary;
   final List<Map<String, dynamic>> sources;
   final WaitEstimate? queueEstimate;
+  final UrgencyAssessment? urgency;
 
   factory CaseDetail.fromJson(dynamic json) {
     final data = mapValue(json);
@@ -407,18 +453,18 @@ class CaseDetail {
       status: textValue(caseMap['status']),
       workflowStatus: textValue(caseMap['workflow_status'], 'UNASSESSED'),
       meta: mapValue(caseMap['meta']),
-      messages: mapList(
-        data['communications'],
-      ).map(PatientMessage.fromJson).toList(growable: false),
-      followups: mapList(
-        data['followups'],
-      ).map(FollowUp.fromJson).toList(growable: false),
-      answers: mapList(
-        data['followup_answers'],
-      ).map(FollowUpAnswer.fromJson).toList(growable: false),
-      escalations: mapList(
-        data['escalations'],
-      ).map(Escalation.fromJson).toList(growable: false),
+      messages: mapList(data['communications'])
+          .map(PatientMessage.fromJson)
+          .toList(growable: false),
+      followups: mapList(data['followups'])
+          .map(FollowUp.fromJson)
+          .toList(growable: false),
+      answers: mapList(data['followup_answers'])
+          .map(FollowUpAnswer.fromJson)
+          .toList(growable: false),
+      escalations: mapList(data['escalations'])
+          .map(Escalation.fromJson)
+          .toList(growable: false),
       warnings: mapList(data['warnings']),
       facts: mapList(data['facts']),
       summary: mapValue(data['summary']),
@@ -426,6 +472,9 @@ class CaseDetail {
       queueEstimate: data['queue_estimate'] == null
           ? null
           : WaitEstimate.fromJson(data['queue_estimate']),
+      urgency: caseMap['urgency'] == null
+          ? null
+          : UrgencyAssessment.fromJson(caseMap['urgency']),
     );
   }
 }
@@ -443,6 +492,8 @@ class CaseSummary {
     this.contradictionCount = 0,
     this.processingFailures = 0,
     this.assignedReviewer,
+    this.urgencyScore,
+    this.urgencySource,
   });
 
   final String caseId;
@@ -456,6 +507,8 @@ class CaseSummary {
   final int contradictionCount;
   final int processingFailures;
   final String? assignedReviewer;
+  final int? urgencyScore;
+  final String? urgencySource;
 
   factory CaseSummary.fromJson(Map<String, dynamic> json) => CaseSummary(
     caseId: textValue(json['case_id']),
@@ -471,5 +524,9 @@ class CaseSummary {
     contradictionCount: intValue(json['contradiction_count']),
     processingFailures: intValue(json['processing_failures']),
     assignedReviewer: json['assigned_reviewer']?.toString(),
+    urgencyScore: json['urgency_score'] == null
+        ? null
+        : intValue(json['urgency_score']),
+    urgencySource: json['urgency_source']?.toString(),
   );
 }

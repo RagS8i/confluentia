@@ -21,6 +21,11 @@
       <input id="user-id" aria-label="User ID" placeholder="User ID" />
       <select id="role" aria-label="Role">
         <option value="clinician">Clinician</option>
+        <option value="doctor">Doctor</option>
+        <option value="nurse">Nurse</option>
+        <option value="physician">Physician</option>
+        <option value="physician_assistant">Physician assistant</option>
+        <option value="nurse_practitioner">Nurse practitioner</option>
         <option value="intake">Intake</option>
         <option value="patient">Patient</option>
         <option value="admin">Admin</option>
@@ -234,6 +239,23 @@
         </div>
 
         <div class="status-strip" id="status-strip"></div>
+
+        <section class="panel" id="urgency-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Advisory urgency · 0 to 100</p>
+              <h2>Patient urgency <span id="urgency-score" class="badge">—</span></h2>
+              <p id="urgency-meta" class="hint"></p>
+            </div>
+          </div>
+          <p id="urgency-rationale" class="hint"></p>
+          <div class="row" id="urgency-edit-row">
+            <input id="urgency-input" type="number" min="0" max="100" step="1" placeholder="0–100" />
+            <input id="urgency-reason" placeholder="Reason for change (required)" />
+            <button id="save-urgency" class="btn small">Update urgency</button>
+          </div>
+          <p class="hint">The SLM score is advisory only. It never changes the workflow category, dismisses warnings, or replaces clinician review. Nurses, doctors and other clinical staff can edit it with an audited reason.</p>
+        </section>
 
         <section id="escalation-panel" class="panel escalation-panel" hidden>
           <div class="panel-head">

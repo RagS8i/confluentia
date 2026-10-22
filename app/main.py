@@ -70,6 +70,9 @@ from .schemas import (
     QueueItem,
     ReviewerAction,
     ReviewEvent,
+    UrgencyAssessment,
+    UrgencyEdit,
+    UrgencySource,
     VerificationStatus,
 )
 from .security import (
@@ -129,6 +132,13 @@ class OverrideRequest(BaseModel):
 
 class AssignRequest(BaseModel):
     reviewer: str = Field(min_length=1)
+    confirmed: bool = False
+
+
+class UrgencyEditRequest(BaseModel):
+    score: int = Field(ge=0, le=100)
+    reason: str = Field(min_length=3, max_length=1000)
+    rationale: Optional[str] = Field(default=None, max_length=1000)
     confirmed: bool = False
 
 
@@ -425,11 +435,14 @@ def list_cases(
                 assigned_reviewer=case.assigned_reviewer,
                 review_status=review_status,
                 consent=consent,
+                urgency_score=case.urgency.score if case.urgency else None,
+                urgency_source=case.urgency.source.value if case.urgency else None,
             )
         )
     items.sort(
         key=lambda item: (
             rank.get(item.workflow_status.value, 9),
+            -(item.urgency_score if item.urgency_score is not None else -1),
             item.received_at,
         )
     )
@@ -1312,6 +1325,92 @@ def assign_reviewer(
         {"reviewer": payload.reviewer, "previous_reviewer": previous},
     )
     return {"case_id": case_id, "assigned_reviewer": payload.reviewer}
+
+
+@router.patch("/cases/{case_id}/urgency")
+def edit_urgency(
+    case_id: str,
+    payload: UrgencyEditRequest,
+    request: Request,
+    principal: Principal = Depends(current_principal),
+):
+    """Clinician override of the advisory urgency score.
+
+    The deterministic workflow status is never changed by this action. The
+    previous score, editor, role, reason and timestamp are retained.
+    """
+    ensure_roles(principal, {"clinician", "admin"})
+    if not payload.confirmed:
+        raise HTTPException(
+            status_code=422,
+            detail="explicit confirmation is required before editing urgency",
+        )
+    case = _load_case(request, case_id, principal)
+    db = _db(request)
+    now = datetime.now(timezone.utc)
+    previous = case.urgency
+    history = list(previous.history) if previous else []
+    history.append(
+        UrgencyEdit(
+            score=payload.score,
+            previous_score=previous.score if previous else None,
+            edited_by=principal.user_id,
+            role=principal.role,
+            reason=payload.reason,
+            edited_at=now,
+        )
+    )
+    original_slm_score = previous.slm_score if previous else None
+    if original_slm_score is None and previous is not None and previous.source == UrgencySource.slm:
+        original_slm_score = previous.score
+    assessment = UrgencyAssessment(
+        score=payload.score,
+        rationale=payload.rationale
+        if payload.rationale is not None
+        else (previous.rationale if previous else ""),
+        source=UrgencySource.clinician,
+        model=previous.model if previous else None,
+        assessed_at=previous.assessed_at if previous else now,
+        assessed_by=previous.assessed_by if previous else None,
+        slm_score=original_slm_score,
+        edited_by=principal.user_id,
+        edited_at=now,
+        edit_reason=payload.reason,
+        model_error=previous.model_error if previous else None,
+        history=history,
+    )
+    case.urgency = assessment
+    db.save_case(case)
+    db.add_review(
+        ReviewEvent(
+            event_id=uuid.uuid4().hex,
+            case_id=case_id,
+            action=ReviewerAction.edit_urgency,
+            actor=principal.user_id,
+            role=principal.role,
+            original_status=case.workflow_status,
+            final_status=case.workflow_status,
+            reason=payload.reason,
+            detail={
+                "previous_score": previous.score if previous else None,
+                "new_score": payload.score,
+                "source": UrgencySource.clinician.value,
+                "workflow_status_unchanged": case.workflow_status.value,
+            },
+        )
+    )
+    db.audit(
+        principal.user_id,
+        principal.role,
+        "urgency_edited",
+        case_id,
+        {
+            "previous_score": previous.score if previous else None,
+            "new_score": payload.score,
+            "reason_recorded": True,
+        },
+    )
+    return {"case_id": case_id, "urgency": assessment.model_dump(mode="json")}
 
 
 # ------------------------------------------------------- patient communications

@@ -17,7 +17,17 @@ from .config import Settings
 from .db import Database
 from .schemas import CaseRecord
 
-VALID_ROLES = {"patient", "intake", "clinician", "admin"}
+CLINICAL_ROLES = frozenset(
+    {
+        "clinician",
+        "doctor",
+        "nurse",
+        "physician",
+        "physician_assistant",
+        "nurse_practitioner",
+    }
+)
+VALID_ROLES = {"patient", "intake", "admin"} | set(CLINICAL_ROLES)
 
 
 @dataclass
@@ -28,7 +38,7 @@ class Principal:
 
     @property
     def is_clinician(self) -> bool:
-        return self.role in {"clinician", "admin"}
+        return self.role in CLINICAL_ROLES or self.role == "admin"
 
 
 def authenticate(
@@ -78,8 +88,14 @@ def current_principal(
 
 
 def ensure_roles(principal: Principal, roles: set[str]) -> None:
-    if principal.role not in roles:
-        raise HTTPException(status_code=403, detail="insufficient role for this action")
+    if principal.role in roles:
+        return
+    # Every clinical endpoint already lists "clinician". Treat named clinical
+    # roles (doctor, nurse, etc.) as equivalents without duplicating the list
+    # at every route.
+    if "clinician" in roles and principal.role in CLINICAL_ROLES:
+        return
+    raise HTTPException(status_code=403, detail="insufficient role for this action")
 
 
 def ensure_case_access(

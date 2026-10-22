@@ -46,6 +46,9 @@ class BaseProvider:
     def draft_summary(self, payload: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def assess_urgency(self, payload: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
+        raise NotImplementedError
+
     def health(self) -> Dict[str, Any]:
         return {"provider": self.name, "model": self.model, "status": "unknown"}
 
@@ -74,6 +77,14 @@ class OllamaProvider(BaseProvider):
                 "draft_referral_note": {"type": "string"},
             },
             "required": ["summary_narrative", "draft_referral_note"],
+        }
+        self._urgency_schema = {
+            "type": "object",
+            "properties": {
+                "urgency_score": {"type": "integer", "minimum": 0, "maximum": 100},
+                "rationale": {"type": "string"},
+            },
+            "required": ["urgency_score", "rationale"],
         }
 
     def _chat(
@@ -168,6 +179,22 @@ class OllamaProvider(BaseProvider):
             }
         except (ValueError, TypeError) as exc:
             raise ModelError("malformed_output", "draft JSON was invalid", True) from exc
+
+    def assess_urgency(self, payload: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
+        from .prompts import URGENCY_SYSTEM, build_urgency_prompt
+
+        user = build_urgency_prompt(payload)
+        content = self._chat(URGENCY_SYSTEM, user, self._urgency_schema)
+        try:
+            parsed = json.loads(_strip_code_fences(content))
+            if not isinstance(parsed, dict):
+                raise ValueError("not an object")
+            return {
+                "urgency_score": parsed.get("urgency_score"),
+                "rationale": str(parsed.get("rationale") or ""),
+            }
+        except (ValueError, TypeError) as exc:
+            raise ModelError("malformed_output", "urgency JSON was invalid", True) from exc
 
     def health(self) -> Dict[str, Any]:
         try:
@@ -542,6 +569,59 @@ class MockProvider(BaseProvider):
             follow_up_questions=questions,
             interpretation_notes=["deterministic mock extraction; not a model evaluation"],
         )
+
+    def assess_urgency(self, payload: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
+        """Deterministic stand-in for tests only; not a clinical model."""
+        self._maybe_fail([])
+        outcome = str(payload.get("workflow_status") or "UNASSESSED")
+        score = {
+            "EMERGENCY": 90,
+            "PRIORITY_REVIEW": 65,
+            "UNASSESSED": 45,
+            "ROUTINE_REVIEW": 15,
+        }.get(outcome, 45)
+        facts = payload.get("facts") or []
+        labels = {
+            str(item.get("label", "")).strip().lower()
+            for item in facts
+            if item.get("status") == "present" and item.get("fact_type") == "symptom"
+        }
+        weights = {
+            "chest pain": 10,
+            "shortness of breath": 10,
+            "breathing difficulty": 10,
+            "bleeding": 8,
+            "seizure": 10,
+            "loss of consciousness": 12,
+            "vomiting": 4,
+        }
+        for label, weight in weights.items():
+            if label in labels:
+                score += weight
+        for item in facts:
+            if item.get("fact_type") not in {"measurement", "vital_sign"}:
+                continue
+            try:
+                value = float(item.get("value"))
+            except (TypeError, ValueError):
+                continue
+            unit = str(item.get("unit") or "").strip().lower()
+            label = str(item.get("label", "")).strip().lower()
+            if ("spo2" in label or "oxygen saturation" in label) and value < 92:
+                score += 8
+            if ("temperature" in label or "temp" in label) and (
+                (unit == "c" and value >= 39) or (unit == "f" and value >= 102.2)
+            ):
+                score += 5
+        score = max(0, min(100, score))
+        return {
+            "urgency_score": score,
+            "rationale": (
+                "Mock advisory urgency derived from the supplied rule outcome, "
+                "present symptoms and measurements. Not a clinical model and not "
+                "clinically validated."
+            ),
+        }
 
     def draft_summary(self, payload: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
         self._maybe_fail([])

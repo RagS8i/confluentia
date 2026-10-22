@@ -23,6 +23,7 @@ from ..schemas import (
     ProcessingRun,
     SourceRecord,
     SourceRef,
+    UrgencySource,
     Warning,
     WarningKind,
 )
@@ -35,6 +36,7 @@ from .normalize import InputError
 from .reconcile import reconcile
 from .summary import generate_summary
 from .timeline import build_timeline
+from .urgency import assess_urgency
 
 
 class ConsentRequired(RuntimeError):
@@ -403,6 +405,39 @@ class PipelineService:
             or case.consent_withdrawn_at is not None
         ):
             raise CaseUnavailable("case was withdrawn or deleted during processing")
+
+        # Advisory urgency is computed after all currently available evidence,
+        # warnings, gaps and contradictions are assembled. It never changes the
+        # deterministic workflow category. Clinician edits are preserved.
+        urgency = self._run_stage(
+            case_id,
+            "G_urgency_assessment",
+            lambda: assess_urgency(
+                case_id=case_id,
+                facts=facts,
+                warnings=triage.warnings,
+                gaps=gaps,
+                discrepancies=discrepancies,
+                timeline=timeline,
+                outcome=triage.outcome,
+                provider=self.provider,
+                settings=self.settings,
+                existing=case.urgency,
+            ),
+        )
+        if urgency.source == UrgencySource.fallback:
+            self.db.audit(
+                actor,
+                "system",
+                "urgency_fallback",
+                case_id,
+                {
+                    "error_code": urgency.model_error or "unknown",
+                    "score": urgency.score,
+                },
+            )
+        case.urgency = urgency
+
         meta = dict(case.meta)
         meta.update(
             {

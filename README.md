@@ -6,19 +6,20 @@ CareFlow AI is a local-first, human-in-the-loop clinical information and triage-
 
 ## What it does
 
-- Ingests STT/OCR output through stable JSON adapters; preserves original text, language metadata, audio timestamps, page numbers and bounding boxes.
+- Ingests STT/OCR output through stable JSON adapters; preserves original text, language metadata, audio timestamps, page numbers and, when supplied, bounding boxes.
 - Extracts facts per source with bounded retries, exact-quote attribution, negation/uncertainty handling and safe partial failure.
 - Reconciles contradictions, historical-vs-current values, unit mismatches and potential duplicates without silently choosing a winner.
 - Detects missing information and generates multilingual follow-up questions without inventing dates.
 - Evaluates deterministic JSON rules independently of the SLM; unresolved/uncertain patterns route to human review instead of being suppressed.
 - Produces an evidence-linked summary, gaps, warnings and an unapproved AI draft note.
 - Supports clinician correction of facts, warning acknowledgement, note editing/approval, status override with reason, assignment and auditable review.
+- Computes an advisory 0-100 urgency score with the SLM after processing all available information. Nurses, doctors and other clinical staff can edit it with a recorded reason; the workflow category is never changed automatically.
 - Drafts curated patient messages in English, Hindi or Hinglish; requires staff approval before any delivery and never generates routine status messages for emergency cases.
-- Explains queue ordering within each triage category, reports operational bottlenecks and only shows wait estimates when staffing and a sufficient observed sample are recorded.
+- Explains queue ordering within each triage category using the urgency score, then the existing operational score, and reports bottlenecks and conservative wait estimates only when staffing and a sufficient observed sample are recorded.
 - Generates persistent follow-up questions from the reviewed summary, requires staff approval, and reprocesses the case when an answer is recorded.
 - Creates immediate, deduplicated emergency escalations before optional summaries or messages; delivery failures remain visible and retryable.
 - Encrypts source text, fact payloads, message bodies, follow-up text, answers and uploaded documents at rest; supports consent withdrawal and resumable deletion jobs.
-- Serves a responsive clinician review UI at `/` and includes a Flutter app in `mobile/` for queue, case, communication, follow-up and escalation workflows.
+- Serves a responsive clinician review UI at `/` and includes a Flutter app in `mobile/` for queue, case, urgency editing, communication, follow-up and escalation workflows.
 
 ## Architecture
 
@@ -53,7 +54,7 @@ Principal components:
 - `app/db.py`, `app/storage.py`, `app/deletion.py` - SQLite persistence, encryption, deletion jobs.
 - `app/security.py` - development header auth / API-key auth and case-level access control.
 - `app/static/` - responsive dependency-free review and coordination UI.
-- `OCR1/` - PaddleOCR-VL extraction, block organizer and reading-order layout, plus an optional standalone API.
+- `OCR1/` - GLM-OCR document extraction via Ollama and the clinical-relevance organizer (in-process).
 - `STT_translation/` - Sarvam speech-to-language implementation, plus an optional standalone API.
 - `mobile/` - Flutter client for Android and iOS.
 
@@ -73,6 +74,7 @@ Copy-Item .env.example .env
 
 # For Qwen instead of mock:
 ollama pull qwen3:8b
+ollama pull glm-ocr
 # then set CAREFLOW_LLM_PROVIDER=ollama in .env
 
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
@@ -97,10 +99,9 @@ pip install -r requirements.txt
 winget install --id Gyan.FFmpeg -e
 ```
 
-PaddleOCR-VL downloads its layout and recognition models on first use into
-`%USERPROFILE%\.paddlex\official_models` (roughly 2 GB). CPU inference is
-functional but slow; install a matching `paddlepaddle-gpu` build for a
-supported CUDA/cuDNN setup if you need faster document processing.
+GLM-OCR runs through the local Ollama server; Ollama loads its weights on the
+first OCR request. No separate model download or GPU-specific wheel is needed
+beyond installing Ollama and pulling `glm-ocr`.
 
 #### Speech-to-Text (Sarvam, in-process)
 
@@ -116,19 +117,14 @@ external integrations and uses the same function:
 uvicorn STT_translation.api:app --host 127.0.0.1 --port 8001
 ```
 
-#### OCR (PaddleOCR-VL, in-process)
+#### OCR (GLM-OCR, in-process)
 
-Document intake calls `ocr_pipeline.process_document()` directly from the
-CareFlow background worker. No OCR server and no port 8002 are needed for the
-website. PaddleOCR-VL runs locally and the block organizer uses the configured
-Ollama model.
-
-The standalone FastAPI wrapper remains available for independent testing or
-external integrations and uses the same extraction path:
-
-```powershell
-uvicorn OCR1.api:app --host 127.0.0.1 --port 8002
-```
+Document intake calls `OCR1.model.extract_document()` and
+`OCR1.organizer.organize_ocr_result()` directly from the CareFlow background
+worker. No OCR server and no OCR port are needed. `OCR1/model.py` sends each
+rendered page to the configured `glm-ocr` model through Ollama, then the
+organizer uses the configured Ollama text model. Set `CAREFLOW_OCR_MODEL` to use
+a different Ollama vision model.
 
 ### Flutter app
 
@@ -196,7 +192,7 @@ The default model name is configurable; this project does not bundle weights. Pu
 
 ## API overview
 
-All `/api` routes except `/api/health` require authentication. In `dev` mode send `X-User-Id` and `X-Role` (`patient`, `intake`, `clinician`, `admin`); patients also send `X-Patient-Id`.
+All `/api` routes except `/api/health` require authentication. In `dev` mode send `X-User-Id` and `X-Role` (`patient`, `intake`, `clinician`, `doctor`, `nurse`, `physician`, `physician_assistant`, `nurse_practitioner`, `admin`); patients also send `X-Patient-Id`. Named clinical roles are treated as clinician equivalents for clinical actions.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -217,6 +213,7 @@ All `/api` routes except `/api/health` require authentication. In `dev` mode sen
 | `POST` | `/api/cases/{id}/note/approve` | Approve note |
 | `POST` | `/api/cases/{id}/override` | Override workflow status with reason |
 | `POST` | `/api/cases/{id}/assign` | Assign reviewer (explicit confirmation required) |
+| `PATCH` | `/api/cases/{id}/urgency` | Edit the advisory 0-100 urgency score with a reason (clinical roles; explicit confirmation required) |
 | `GET` | `/api/communications/templates` | Curated templates by language |
 | `POST` | `/api/cases/{id}/communications/draft` | Draft a curated status, wait, document, missing-information or urgent-review message |
 | `GET` | `/api/cases/{id}/communications` | List messages (patients see sent messages only) |
@@ -234,6 +231,8 @@ All `/api` routes except `/api/health` require authentication. In `dev` mode sen
 | `GET` | `/api/rules` | Rule config (clinician/admin) |
 
 Workflow outcomes are `EMERGENCY`, `PRIORITY_REVIEW`, `UNASSESSED`, `ROUTINE_REVIEW`. `UNASSESSED` is used when information is insufficient, unreliable or processing failed; it is never a reassuring result. `ROUTINE_REVIEW` is a workflow queue label, not clinical clearance.
+
+The urgency score is a separate advisory coordination signal, not a workflow outcome. It is ordered within the deterministic priority category and is never used to move a case into a higher or lower category. If the model fails, a deterministic fallback score is stored and labelled as such. Clinician-edited scores are preserved on reprocessing and every edit records the previous score, editor, role, reason and timestamp.
 
 Example:
 
@@ -262,7 +261,7 @@ Consent must be granted before ingestion/processing. In the demo, `intake` or `a
 
 - Not a diagnosis, prescription, disposition or clinical-clearance system; no autonomous patient-facing advice.
 - Demo thresholds are not an approved triage protocol and have not been clinically validated.
-- STT (Sarvam) and OCR (PaddleOCR-VL) are external model components; this repo integrates them and preserves provenance. Do not fabricate confidence or clinical accuracy metrics.
+- STT (Sarvam) and OCR (GLM-OCR via Ollama) are external model components; this repo integrates them and preserves provenance. Do not fabricate confidence or clinical accuracy metrics.
 - Patient messages are curated templates, not generative clinical advice. Only `en`, `hi` and `hinglish` variants exist; missing variants fail safely rather than being machine-translated at runtime.
 - Wait estimates are operational estimates, not guarantees. They are unavailable for emergency cases and when staffing, review-time data or the minimum sample is missing.
 - Follow-up suggestions do not replace clinician review, emergency escalation or direct communication.
@@ -275,7 +274,7 @@ Consent must be granted before ingestion/processing. In the demo, `intake` or `a
 
 ```
 app/                 FastAPI app, pipeline, model providers, rules, website
-OCR1/                PaddleOCR-VL extraction, organizer and reading-order parser (+ optional standalone API)
+OCR1/                GLM-OCR extraction via Ollama and the clinical-relevance organizer (in-process)
 STT_translation/     Sarvam speech-to-language implementation (+ optional standalone API)
 mobile/              Flutter client (Android/iOS)
 tests/               pytest suite (synthetic data, mock provider, integration)

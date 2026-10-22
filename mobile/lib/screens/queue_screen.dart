@@ -111,9 +111,8 @@ class _QueueScreenState extends State<QueueScreen> {
       await _openCase(caseId);
     } on ApiException catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.message)));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error.message)));
     }
   }
 
@@ -297,6 +296,7 @@ class _QueueScreenState extends State<QueueScreen> {
                             Text(
                               '${item.workflowStatus.replaceAll('_', ' ')} Â· '
                               'consent ${item.consent} Â· '
+                              '${item.urgencyScore != null ? 'urgency ${item.urgencyScore}/100 Â· ' : ''}'
                               '${item.warningCount} warning(s)',
                               style: const TextStyle(
                                 fontSize: 11.5,
@@ -518,6 +518,7 @@ class _QueueCaseCard extends StatelessWidget {
                         Text(
                           '${item.patientId} Â· '
                           '${item.workflowStatus.replaceAll('_', ' ')}'
+                          '${item.urgencyScore != null ? ' Â· urgency ${item.urgencyScore}/100' : ''}'
                           '${item.awaitingMinutes != null ? ' Â· ${item.awaitingMinutes} min awaiting' : ''}',
                           style: const TextStyle(
                             fontSize: 11,

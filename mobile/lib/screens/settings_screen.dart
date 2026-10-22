@@ -134,14 +134,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   labelText: 'Role',
                   prefixIcon: Icon(Icons.manage_accounts_outlined, size: 19),
                 ),
-                items: const ['clinician', 'admin', 'intake', 'patient']
-                    .map(
-                      (role) => DropdownMenuItem(
-                        value: role,
-                        child: Text(role.replaceAll('_', ' ')),
-                      ),
-                    )
-                    .toList(),
+                items:
+                    const [
+                          'clinician',
+                          'doctor',
+                          'nurse',
+                          'physician',
+                          'physician_assistant',
+                          'nurse_practitioner',
+                          'admin',
+                          'intake',
+                          'patient',
+                        ]
+                        .map(
+                          (role) => DropdownMenuItem(
+                            value: role,
+                            child: Text(role.replaceAll('_', ' ')),
+                          ),
+                        )
+                        .toList(),
                 onChanged: (value) {
                   if (value != null) setState(() => _role = value);
                 },
