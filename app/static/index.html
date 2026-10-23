@@ -33,6 +33,11 @@
       <input id="patient-id" aria-label="Patient ID" placeholder="Patient ID" />
       <button id="save-identity" class="btn secondary">Set identity</button>
     </div>
+    <div class="api-bridge">
+      <input id="api-url" aria-label="Backend API URL" placeholder="Backend URL (leave empty if local)" title="Leave empty for local /api or enter your port-forwarded URL (e.g. https://...ngrok-free.app)" />
+      <button id="save-api-url" class="btn secondary small" title="Connect to backend">Connect</button>
+      <span id="api-status-pill" class="badge" title="Connection status">checking...</span>
+    </div>
   </header>
 
   <div class="disclaimer">

@@ -69,6 +69,12 @@ def safe_intake_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f"Intake service returned HTTP {exc.response.status_code}. Please retry."
     if isinstance(exc, InputError):
+        if exc.code == "non_medical_document":
+            return (
+                "Non-medical document rejected: The file was read successfully by OCR, but the AI clinical safety "
+                "filter detected no clinically relevant content (e.g. railway ticket, receipt, or non-medical file). "
+                "Please upload a clinical report, lab slip, or prescription."
+            )
         return f"Input error: {exc.message}"
     if isinstance(exc, RuntimeError):
         return f"{exc}"
@@ -598,7 +604,10 @@ class IntakeService:
             )
 
         except Exception as exc:
-            safe_msg = f"Document OCR extraction failed: {safe_intake_error(exc)}"
+            if isinstance(exc, InputError):
+                safe_msg = safe_intake_error(exc)
+            else:
+                safe_msg = f"Document OCR extraction failed: {safe_intake_error(exc)}"
             logger.exception("Document intake job %s failed: %s", job_id, safe_msg)
             # The original document remains in DocumentStore and DB for retry/inspection
             job.fail(safe_msg)

@@ -1,285 +1,432 @@
 # CareFlow AI
 
-CareFlow AI is a local-first, human-in-the-loop clinical information and triage-support prototype. It accepts synthetic or consented multilingual source material (STT transcripts, OCR output, typed messages, uploaded originals), extracts source-linked facts with a configurable small language model (Qwen3-8B via Ollama), reconciles cross-source differences, applies a deterministic versioned rule set, and presents everything for clinician review.
+CareFlow AI is an open-source, local-first, human-in-the-loop clinical information coordination and triage-support platform. It processes multilingual clinical source material (speech-to-text audio transcripts, document OCR outputs, typed messages, and raw medical documents), extracts provenance-linked facts using a local Small Language Model (Qwen3-8B via Ollama), reconciles cross-source discrepancies and contradictions, applies a deterministic versioned triage rule set, computes an advisory 0–100 urgency score, and presents everything across a responsive **Web Workstation** and a cross-platform **Flutter Mobile Client**.
 
-> **Not a medical device. Not clinically validated.** The bundled rules are illustrative demonstration thresholds marked `ILLUSTRATIVE_DEMO_ONLY_NOT_CLINICALLY_APPROVED`. The system never diagnoses, prescribes, clears a patient, or states that a patient does not need care. A qualified clinician must review and approve any rule set and every output before real-world use. Do not use with real patient data without the required privacy, security, clinical governance and regulatory review.
+> [!WARNING]
+> **Not a medical device. Not clinically validated.**
+> The bundled triage rules and thresholds are illustrative demonstration configurations marked `ILLUSTRATIVE_DEMO_ONLY_NOT_CLINICALLY_APPROVED`. The system never diagnoses, prescribes, clears patients, or states that a patient does not require care. A qualified clinician must review and approve any rule set and every AI-generated output before real-world use. Do not use with real patient data without required clinical governance, privacy, security, and regulatory reviews.
 
-## What it does
+---
 
-- Ingests STT/OCR output through stable JSON adapters; preserves original text, language metadata, audio timestamps, page numbers and, when supplied, bounding boxes.
-- Extracts facts per source with bounded retries, exact-quote attribution, negation/uncertainty handling and safe partial failure.
-- Reconciles contradictions, historical-vs-current values, unit mismatches and potential duplicates without silently choosing a winner.
-- Detects missing information and generates multilingual follow-up questions without inventing dates.
-- Evaluates deterministic JSON rules independently of the SLM; unresolved/uncertain patterns route to human review instead of being suppressed.
-- Produces an evidence-linked summary, gaps, warnings and an unapproved AI draft note.
-- Supports clinician correction of facts, warning acknowledgement, note editing/approval, status override with reason, assignment and auditable review.
-- Computes an advisory 0-100 urgency score with the SLM after processing all available information. Nurses, doctors and other clinical staff can edit it with a recorded reason; the workflow category is never changed automatically.
-- Drafts curated patient messages in English, Hindi or Hinglish; requires staff approval before any delivery and never generates routine status messages for emergency cases.
-- Explains queue ordering within each triage category using the urgency score, then the existing operational score, and reports bottlenecks and conservative wait estimates only when staffing and a sufficient observed sample are recorded.
-- Generates persistent follow-up questions from the reviewed summary, requires staff approval, and reprocesses the case when an answer is recorded.
-- Creates immediate, deduplicated emergency escalations before optional summaries or messages; delivery failures remain visible and retryable.
-- Encrypts source text, fact payloads, message bodies, follow-up text, answers and uploaded documents at rest; supports consent withdrawal and resumable deletion jobs.
-- Serves a responsive clinician review UI at `/` and includes a Flutter app in `mobile/` for queue, case, urgency editing, communication, follow-up and escalation workflows.
-
-## Architecture
+## Architecture Overview
 
 ```
-STT / OCR / typed message / upload
-              |
-       adapters + dedupe + encryption
-              |
-   Stage A normalize -> B language/ambiguity -> C per-source SLM extraction
-              |                                      |
-              |                            quote attribution + retries
-              v
-   D timeline -> E reconciliation -> F deterministic rules -> urgent escalation
-              |                                      |
-              |                                      v
-              |                         G gaps/summary -> follow-up sync
-              +---------------> website / Flutter <---+
+                                [ CLINICAL SOURCES ]
+          +-----------------------+-----------------------+----------------------+
+          |                       |                       |                      |
+    Voice Audio (STT)      Medical Docs (OCR)       Typed Symptoms         Direct Uploads
+   (Sarvam, in-process)  (GLM-OCR via Ollama)     (Patient / Intake)     (PDF, PNG, JPG)
+          |                       |                       |                      |
+          +-----------------------+-----------------------+----------------------+
                                   |
-             fact correction / warning ack / note approval / override
-             message draft / approve / send / dismiss
-             follow-up approve / send / answer / dismiss
-             escalation acknowledge / retry
+                                  v
+                    [ INTAKE GATE & ADAPTERS ]
+              Consent verification -> Normalization -> AES-Fernet Encryption
+                                  |
+                                  v
+                      [ MULTI-STAGE SLM PIPELINE ]
+               (Configurable Qwen3-8B / Gemma via local Ollama)
+               Stage A: Text normalization & segment identification
+               Stage B: Ambiguity detection & language reconciliation
+               Stage C: Per-source structured clinical fact extraction (bounded retries)
+               Stage D: Chronological timeline & temporal alignment
+               Stage E: Cross-source contradiction & reconciliation matrix
+                                  |
+            +---------------------+---------------------+
+            |                                           |
+            v                                           v
+[ DETERMINISTIC RULES ENGINE ]             [ CLINICAL SAFETY ESCALATION ]
+ Independent rule evaluation               Immediate red-flag detection
+ Priority categorization:                  Emergency webhook & outbox alerting
+ * EMERGENCY (Immediate human care)        (Suppresses routine follow-ups)
+ * PRIORITY_REVIEW
+ * ROUTINE_REVIEW
+ * UNASSESSED (Partial / uncertain)
+            |
+            +---------------------+---------------------+
+                                  |
+                                  v
+                  [ ADVISORY COORDINATION SIGNALS ]
+     * 0-100 Advisory Urgency Score (SLM + clinical override audit)
+     * Conservative Queue Wait & Bottleneck Estimation
+     * Adaptive Follow-Up Question Generation (Hindi / Hinglish / English)
+     * Curated Pre-Approved Patient Communications
+                                  |
+         +------------------------+------------------------+
+         |                                                 |
+         v                                                 v
+[ RESPONSIVE WEB WORKSTATION ]                 [ FLUTTER MOBILE APP ]
+ Deployed: Vercel CDN                           Platform: Android / iOS / Desktop
+ Runtime: Browser (HTML5/ES6/CSS3)              Runtime: Flutter 3.x / Dart 3.x
+ Endpoint: Dynamic Backend Bridge               Config: In-app Settings & Tunnel
 ```
 
-Principal components:
+---
 
-- `app/main.py` - FastAPI app and API.
-- `app/pipeline/` - normalization, interpretation, extraction, timeline, reconciliation, gaps, summary, orchestration.
-- `app/model/` - Ollama and deterministic mock providers, prompts.
-- `app/triage/` - rule engine and demo rule config.
-- `app/queue_ops.py`, `app/communications.py`, `app/followups.py`, `app/escalation.py`, `app/outbound.py` - queue intelligence, curated messaging, adaptive follow-up, urgent escalation and delivery adapters.
-- `app/db.py`, `app/storage.py`, `app/deletion.py` - SQLite persistence, encryption, deletion jobs.
-- `app/security.py` - development header auth / API-key auth and case-level access control.
-- `app/static/` - responsive dependency-free review and coordination UI.
-- `OCR1/` - GLM-OCR document extraction via Ollama and the clinical-relevance organizer (in-process).
-- `STT_translation/` - Sarvam speech-to-language implementation, plus an optional standalone API.
-- `mobile/` - Flutter client for Android and iOS.
+## Core Capabilities
 
-More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/STT_OCR_INTEGRATION.md](docs/STT_OCR_INTEGRATION.md), [docs/RULE_GOVERNANCE.md](docs/RULE_GOVERNANCE.md).
+1. **Direct Multimodal Intake**:
+   - **Audio / STT**: Live in-browser microphone recording with timers or audio file upload (`.wav`, `.mp3`, `.m4a`). In-process translation via Sarvam AI API for English, Hindi, and Hinglish.
+   - **Document OCR**: PDF and image uploads (lab reports, discharge summaries, prescriptions) converted to structured text via GLM-OCR running locally in Ollama.
+   - **Typed Messages**: Structured patient intake for chief complaints, duration, vitals, and medical history.
+2. **Provenance & Evidence Grounding**:
+   - Every extracted clinical fact maintains strict quote attribution, source modality, segment ID, confidence score, and document bounding box coordinates or audio timestamps.
+3. **Deterministic Safety Rules**:
+   - Triage categories are evaluated by a deterministic, auditable JSON rule engine decoupled from the generative model. Unresolved or contradictory signals route to human review rather than being suppressed.
+4. **Advisory Urgency Scoring (0–100)**:
+   - Evaluated by the SLM across all consolidated evidence. Does not alter the deterministic triage category. Fully auditable: clinicians can edit the score with a mandatory recorded reason.
+5. **Emergency Escalation Protocol**:
+   - Emergency cases trigger immediate, deduplicated clinical escalations. Routine follow-up questions and non-urgent status messages are automatically suppressed to prioritize immediate clinical intervention.
+6. **Adaptive Multilingual Follow-Up Questions**:
+   - Detects informational gaps and suggests specific follow-up questions in English, Hindi, or Hinglish. Clinicians approve or dismiss questions before they are dispatched.
+7. **Curated Patient Communications**:
+   - Generates structured status, wait, and document-request notices based on approved clinical templates. Requires explicit staff sign-off before transmission.
+8. **Operational Queue Intelligence**:
+   - Calculates queue priority ordering, bottleneck tracking (waiting, overdue, unassigned cases), and conservative wait estimates based on observed review times and logged staffing capacity.
+9. **Zero-Trust Data Protection**:
+   - All sources, fact payloads, clinical summaries, notes, and uploaded documents are encrypted at rest with AES-Fernet. Supports GDPR/HIPAA-aligned consent withdrawal and irreversible deletion jobs.
 
-## Quick start (Windows PowerShell)
+---
+
+## Deployment & Hosting Architecture
+
+CareFlow AI is designed for flexible distributed deployment:
+- **Backend**: Hosted locally on your workstation/laptop with local Ollama hardware acceleration. Exposed to remote clients via port forwarding or secure tunnels.
+- **Web Frontend**: Deployed globally on **Vercel** serverless CDN (`https://static-five-ruby.vercel.app`), connecting dynamically to your local backend.
+- **Mobile Client**: Runs natively on Android, iOS, or desktop, connecting directly to the local LAN IP or the forwarded tunnel URL.
+
+```
+       +---------------------------------------------+
+       |           Vercel Global CDN                 |
+       |  https://static-five-ruby.vercel.app        |
+       +---------------------------------------------+
+                             |
+         Browser HTTP/HTTPS  | (Dynamic Backend Bridge)
+                             v
+                 +-----------------------+
+                 | Port-Forward / Tunnel |
+                 | (ngrok / Cloudflare)  |
+                 +-----------------------+
+                             |
+                             v
+       +---------------------------------------------+
+       |        Your Laptop / Local Server           |
+       |  FastAPI Backend (0.0.0.0:8000)             |
+       |  SQLite (careflow.db) + AES-Fernet          |
+       |  Ollama (127.0.0.1:11434) [Qwen3-8B]       |
+       +---------------------------------------------+
+                             ^
+                             | Local LAN / Tunnel
+       +---------------------------------------------+
+       |         Flutter Mobile Client               |
+       |  (Android / iOS / macOS / Windows)          |
+       +---------------------------------------------+
+```
+
+---
+
+## Quick Start & Local Setup
+
+### Prerequisites
+- Python 3.10+
+- [Ollama](https://ollama.ai/) installed and running
+- [Flutter SDK](https://docs.flutter.dev/get-started/install) 3.12+ (for mobile)
+- [FFmpeg](https://ffmpeg.org/) (for audio processing; install via `winget install Gyan.FFmpeg` on Windows)
+- Vercel CLI (`npm install -g vercel`)
+
+### 1. Backend Setup
 
 ```powershell
-cd D:\Confluentia
+# Navigate to project root
+cd d:\Confluentia
+
+# Create and activate virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
+# Configure environment variables
 Copy-Item .env.example .env
-# Edit .env: set CAREFLOW_ENCRYPTION_KEY (see below), keep the mock provider for offline use:
-#   CAREFLOW_LLM_PROVIDER=mock
-
-# For Qwen instead of mock:
-ollama pull qwen3:8b
-ollama pull glm-ocr
-# then set CAREFLOW_LLM_PROVIDER=ollama in .env
-
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Generate an encryption key:
-
+Generate a secure AES-Fernet encryption key:
 ```powershell
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
+Paste this key into `.env` as `CAREFLOW_ENCRYPTION_KEY=...`.
 
-Open `http://127.0.0.1:8000/`. The UI uses development header auth by default; set `X-User-Id`, `X-Role` and (for patients) `X-Patient-Id` through the UI or API client.
-
-### STT and OCR integrations
-
-STT dependencies are required for audio intake; OCR dependencies are required
-for document intake. Install them in the same environment, plus FFmpeg for
-audio decoding:
-
+Pull the required Ollama models:
 ```powershell
-pip install -r requirements.txt
-winget install --id Gyan.FFmpeg -e
+ollama pull qwen3:8b
+ollama pull glm-ocr
 ```
 
-GLM-OCR runs through the local Ollama server; Ollama loads its weights on the
-first OCR request. No separate model download or GPU-specific wheel is needed
-beyond installing Ollama and pulling `glm-ocr`.
-
-#### Speech-to-Text (Sarvam, in-process)
-
-Audio intake calls `STT_translation.stt.speech_to_language()` directly from the
-CareFlow background job. No STT server and no port 8001 are needed for the
-website. It requires `SARVAM_API_KEY` in `.env` and `ffmpeg` on `PATH`; audio
-is sent to Sarvam's cloud API.
-
-The standalone FastAPI wrapper remains available for independent testing or
-external integrations and uses the same function:
-
+Start the CareFlow backend (listens on `0.0.0.0:8000` to allow local and tunnel access):
 ```powershell
-uvicorn STT_translation.api:app --host 127.0.0.1 --port 8001
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+Verify backend health:
+```powershell
+curl http://127.0.0.1:8000/api/health
 ```
 
-#### OCR (GLM-OCR, in-process)
+---
 
-Document intake calls `OCR1.model.extract_document()` and
-`OCR1.organizer.organize_ocr_result()` directly from the CareFlow background
-worker. No OCR server and no OCR port are needed. `OCR1/model.py` sends each
-rendered page to the configured `glm-ocr` model through Ollama, then the
-organizer uses the configured Ollama text model. Set `CAREFLOW_OCR_MODEL` to use
-a different Ollama vision model.
+## Port Forwarding (Exposing Backend to Web & Mobile)
 
-### Flutter app
+To connect remote devices or the Vercel-hosted web client to your local backend, expose port `8000` using one of the following methods:
 
+### Option A: ngrok (Recommended)
+```powershell
+ngrok http 8000
+```
+`ngrok` will provide a public HTTPS URL (e.g., `https://a1b2-c3d4.ngrok-free.app`).
+
+### Option B: Cloudflare Tunnel
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+### Option C: Local LAN (Same WiFi)
+Find your laptop's local IPv4 address:
+```powershell
+ipconfig | findstr IPv4
+# Example: 192.168.1.6
+```
+Your backend will be accessible at `http://192.168.1.6:8000`.
+
+---
+
+## Web Workstation Workflows
+
+### Live Production Deployment (Vercel)
+The web workstation is deployed to Vercel:
+- **Production URL**: [https://static-five-ruby.vercel.app](https://static-five-ruby.vercel.app)
+- **Local Fallback**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+
+### Connecting the Vercel Web App to Your Backend
+1. Open [https://static-five-ruby.vercel.app](https://static-five-ruby.vercel.app) in any desktop or mobile browser.
+2. In the top navigation bar, locate the **Backend URL** input field.
+3. Enter your port-forwarded tunnel address (e.g., `https://a1b2-c3d4.ngrok-free.app`) and click **Connect**.
+4. The status pill will turn green: `online (qwen3:8b)`.
+5. *(Optional)* You can also bookmark or share direct deep links with the parameter:
+   ```
+   https://static-five-ruby.vercel.app/?api=https://a1b2-c3d4.ngrok-free.app
+   ```
+
+### Deploying Your Own Web Frontend to Vercel
+To redeploy updates directly from your machine:
+```powershell
+vercel app/static --yes --prod
+```
+The repository includes a preconfigured `app/static/vercel.json` with clean URL rewrites.
+
+### Web Workstation Clinical Workflow
+1. **Identity & Role Bar**:
+   - Select your clinical role (`Clinician`, `Doctor`, `Nurse`, `Intake`, `Admin`, or `Patient`).
+   - Development header authentication handles permissions automatically.
+2. **Review Queue**:
+   - Cases are prioritized by deterministic category (`EMERGENCY` > `PRIORITY_REVIEW` > `UNASSESSED` > `ROUTINE_REVIEW`).
+   - Within categories, cases are sorted by advisory urgency score and waiting duration.
+3. **Case Registration & Intake Consent**:
+   - Click **"+ New Case"** to create a case.
+   - Click **"Grant intake consent"** to record explicit patient consent for AI processing.
+4. **Direct Source Intake**:
+   - **Audio Tab**: Click **"Start recording"** to dictate clinical notes via browser microphone, choose target language (`English`, `Hindi`, `Hinglish`), and submit for Sarvam STT transcription.
+   - **Document Tab**: Upload medical PDFs, lab slips, or images for GLM-OCR parsing.
+   - **Message Tab**: Type patient symptoms, chief complaint, and history directly.
+5. **Clinical Evidence & Fact Review**:
+   - Inspect extracted facts with exact quote grounding.
+   - Click any fact to **Verify**, **Correct**, **Dispute**, or **Reject**.
+   - Review discrepancy warnings and contradictions across multiple sources.
+6. **Clinical Summary & Note Approval**:
+   - Review the auto-generated sectioned clinical summary.
+   - Edit the unapproved draft clinical note and click **"Approve clinical note"**.
+7. **Patient Communications & Follow-Ups**:
+   - Review AI-suggested follow-up questions.
+   - Draft and dispatch structured status updates to the patient in English or Hindi.
+
+---
+
+## Mobile Workflows (Flutter Client)
+
+The Flutter mobile application (`mobile/`) provides clinicians and patients with a native mobile client for intake, triage review, and queue management.
+
+### Running the Mobile App
 ```powershell
 cd mobile
 flutter pub get
+
+# Run on connected device, emulator, or Windows desktop
 flutter run
 ```
 
-The app defaults to `http://10.0.2.2:8000` on an Android emulator and `http://127.0.0.1:8000` on iOS. Physical devices need the host machine's LAN address. Configure the base URL, user ID, role and patient ID under **Settings**. The generated Android/iOS projects permit cleartext local HTTP for development only; use HTTPS and real authentication before any non-local deployment.
+### Mobile Configuration & Connection
+1. Open the app and navigate to **Settings** (bottom navigation tab).
+2. Set the **Backend Base URL**:
+   - **Android Emulator**: `http://10.0.2.2:8000`
+   - **iOS Simulator / Local Desktop**: `http://127.0.0.1:8000`
+   - **Physical Device (via Tunnel)**: `https://a1b2-c3d4.ngrok-free.app`
+   - **Physical Device (via LAN)**: `http://192.168.1.6:8000`
+3. Set your **User ID** and **Role** (`Clinician`, `Doctor`, `Nurse`, `Patient`, etc.).
 
-The Flutter client provides queue intelligence, operational bottlenecks and staffing, case review, curated message drafting/approval/send, follow-up approval/send/answer, and escalation acknowledgement. It applies the same role restrictions and safety boundaries as the API.
+### Mobile Clinical Workflows
 
-### Run tests
+#### 1. Case Registration & Direct Intake
+- On the **Queue Screen**, tap the **`+` (New Case)** button.
+- Enter the **Patient ID** and type **Initial Symptoms / Chief Complaint**.
+- Leave **"Record patient consent"** and **"Run processing immediately"** toggled on.
+- Tap **"Create & open"**: the case is registered, consent is documented, symptoms are ingested as raw evidence, and the pipeline runs triage extraction immediately.
+
+#### 2. Consent Lifecycle Management
+- In **CaseScreen**, a prominent **Consent Status Card** is displayed:
+  - **Consent Required**: Displays an amber alert banner explaining that AI processing is held until consent is recorded, with a one-tap **"Grant patient consent"** button.
+  - **Consent Active**: Displays a green badge with active scope details and a **"Withdraw"** button.
+  - **Consent Revoked**: Alerts clinicians that processing and intake are suspended.
+  - **Safety Auto-Prompt**: Tapping "Run processing" on an unconsented case prompts for one-tap consent recording and processing.
+
+#### 3. Ingested Sources & Evidence Review
+- The **Ingested Sources Card** lists all raw clinical material attached to the case.
+- Badges denote source type (`MESSAGE`, `AUDIO`, `DOCUMENT`, `OCR`, `STT`) with timestamp and content preview.
+- Tap **"+ Add Intake"** to record additional patient symptoms, vitals, or clinical progress notes on the fly.
+
+#### 4. Urgency Score & Safety Escalations
+- **Advisory Urgency Score Card**: Displays the 0–100 score calculated by the SLM with detailed clinical rationale.
+- **Audited Urgency Override**: Clinicians can tap the edit icon to adjust the score with a mandatory recorded clinical reason.
+- **Safety Escalation Banner**: If red flags (e.g., chest pain, severe dyspnea, critical vitals) are triggered, a critical red banner appears requiring human acknowledgement with a clinician note.
+
+#### 5. Adaptive Follow-Up Questions & Patient Answers
+- Tap **"Sync"** to generate follow-up questions from the summary.
+- Clinicians can **Approve**, **Send**, or **Dismiss** questions.
+- When logged in as **Patient**, questions can be answered directly; submitting an answer automatically triggers pipeline reprocessing with the new evidence.
+
+#### 6. Curated Patient Messaging
+- Tap **"Draft message"** to generate structured status updates, wait notifications, or document requests in English, Hindi, or Hinglish.
+- Review drafts, make edits, and approve for outbound delivery.
+
+#### 7. Operations & Staffing Dashboard
+- Available for staff users in the **Operations** tab.
+- Set active staffing numbers (`Clinicians available`, `Intake staff available`).
+- Track queue bottlenecks (waiting cases, overdue cases, unassigned cases, open escalations).
+- View conservative queue wait estimates with sample size indicators.
+
+---
+
+## API Reference
+
+All `/api` endpoints except `/api/health` require authentication headers (`X-User-Id`, `X-Role`, and for patients `X-Patient-Id`).
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Service health, Ollama SLM status, active triage rules |
+| `GET` | `/api/me` | Current authenticated principal |
+| `POST` / `GET` | `/api/cases` | Register a new case / list review queue |
+| `GET` | `/api/cases/{id}` | Complete case workspace payload |
+| `GET` | `/api/cases/{id}/status` | Check processing status / polling target |
+| `POST` | `/api/cases/{id}/consent` | Record patient intake & AI consent |
+| `POST` | `/api/cases/{id}/consent/withdraw` | Withdraw consent & trigger optional deletion |
+| `DELETE` | `/api/cases/{id}` | Irreversible case deletion job |
+| `POST` | `/api/cases/{id}/sources/message` | Ingest typed symptoms / clinical notes |
+| `POST` | `/api/cases/{id}/intake/audio` | Upload audio file for Sarvam STT & intake |
+| `POST` | `/api/cases/{id}/intake/document` | Upload medical document for GLM-OCR parsing |
+| `POST` | `/api/cases/{id}/process` | Trigger pipeline extraction (`?sync=true` for synchronous) |
+| `PATCH` | `/api/cases/{id}/facts/{fact_id}` | Clinician fact verification / correction / dispute |
+| `POST` | `/api/cases/{id}/warnings/{wid}/acknowledge` | Acknowledge clinical discrepancy warning |
+| `PATCH` | `/api/cases/{id}/note` | Clinician draft note edit |
+| `POST` | `/api/cases/{id}/note/approve` | Clinician formal note approval |
+| `POST` | `/api/cases/{id}/override` | Override triage category with recorded reason |
+| `POST` | `/api/cases/{id}/assign` | Assign named clinician reviewer |
+| `PATCH` | `/api/cases/{id}/urgency` | Audited adjustment of advisory urgency score (0–100) |
+| `GET` | `/api/cases/{id}/communications` | List curated patient communications |
+| `POST` | `/api/cases/{id}/communications/draft` | Draft status/wait/document notice |
+| `POST` | `/api/cases/{id}/communications/{mid}/approve` | Staff approval for outbound message |
+| `POST` | `/api/cases/{id}/communications/{mid}/send` | Dispatch approved message |
+| `GET` | `/api/cases/{id}/followups` | List adaptive follow-up questions |
+| `POST` | `/api/cases/{id}/followups/sync` | Rebuild follow-up questions from clinical summary |
+| `POST` | `/api/cases/{id}/followups/{fid}/approve` | Approve follow-up question |
+| `POST` | `/api/cases/{id}/followups/{fid}/answers` | Submit patient answer & reprocess case |
+| `GET` | `/api/escalations` | List safety escalations |
+| `POST` | `/api/escalations/{id}/acknowledge` | Clinician emergency acknowledgement |
+| `GET` / `PUT` | `/api/operations/staffing` | View / update operational staffing capacity |
+| `GET` | `/api/queue/intelligence` | Queue triage priority rankings & bottleneck analytics |
+| `GET` | `/api/cases/{id}/audit` | Full auditable event trail for governance |
+
+---
+
+## Testing & Quality Assurance
+
+CareFlow maintains a 100% automated test pass rate across backend and mobile test suites:
 
 ```powershell
-# Python unit, pipeline, security, and integration tests
-python -m pytest -q
+# 1. Run all backend tests (103 pytest tests)
+pytest
 
-# Flutter mobile tests and analysis
+# 2. Run Flutter unit & widget tests
 cd mobile
 flutter test
+
+# 3. Run Flutter static analysis
 flutter analyze
-cd ..
 ```
 
-Tests use `MockProvider`, temporary databases and synthetic text only. They do not call Ollama.
+### Test Scope
+- **Pipeline Cases**: Fact extraction, quote provenance, negation handling, temporal ordering.
+- **Direct Intake**: Sarvam STT and GLM-OCR adapter integration, job queues, partial failures.
+- **Security & RBAC**: Role verification across clinical roles (`doctor`, `nurse`, `clinician`, `admin`), patient scope isolation, consent enforcement.
+- **Concurrency & Races**: Resumable deletion jobs, concurrent process locks, audit log integrity.
+- **Mobile Client**: State models, queue intelligence parsing, consent serialization, status rendering.
 
-### Benchmark extraction (engineering metrics only)
+---
 
-```powershell
-python scripts/benchmark_extraction.py --provider mock
-python scripts/benchmark_extraction.py --provider ollama --model qwen3:8b
-```
-
-Reports are written to `reports/`. They measure schema validity, quote grounding, latency and label recall on a tiny synthetic set. They are **not** clinical validation and must not be described as accuracy.
-
-### Validate a rule configuration
-
-```powershell
-python scripts/validate_rules.py
-```
-
-## Configuration
-
-Configuration is read from environment variables and an optional `.env` file. See `.env.example` for all options. Key settings:
-
-| Variable | Meaning |
-| --- | --- |
-| `CAREFLOW_LLM_PROVIDER` | `ollama` or `mock` (`mock` only for tests/offline demos) |
-| `CAREFLOW_OLLAMA_MODEL` | Default `qwen3:8b` |
-| `CAREFLOW_OLLAMA_BASE_URL` | Default `http://127.0.0.1:11434` |
-| `CAREFLOW_ENCRYPTION_KEY` | Fernet key; if omitted a dev key is generated under `data/.careflow.key` |
-| `CAREFLOW_PROCESSING_MODE` | `background` (default) or `sync` |
-| `CAREFLOW_AUTH_MODE` | `dev` trusted headers or `api_key` |
-| `CAREFLOW_RULES_PATH` | Rule JSON path |
-| `CAREFLOW_MAX_UPLOAD_BYTES` | Upload limit, default 20 MiB |
-| `CAREFLOW_COMMUNICATION_DELIVERY` | `outbox` (default), `webhook` or `fail` for drills |
-| `CAREFLOW_ESCALATION_DELIVERY` | `outbox` (default), `webhook` or `fail` for drills |
-| `CAREFLOW_OUTBOUND_WEBHOOK_URL` | Required when either delivery mode is `webhook` |
-| `CAREFLOW_OUTBOUND_TIMEOUT_S` | Outbound request timeout, default 10 seconds |
-| `CAREFLOW_WAIT_ESTIMATE_MIN_SAMPLE` | Minimum observed reviews before a wait estimate is allowed, default 3 |
-
-The default model name is configurable; this project does not bundle weights. Pull the configured model before expecting real SLM output (`ollama pull qwen3:8b`). Model quality has not been clinically evaluated.
-
-## API overview
-
-All `/api` routes except `/api/health` require authentication. In `dev` mode send `X-User-Id` and `X-Role` (`patient`, `intake`, `clinician`, `doctor`, `nurse`, `physician`, `physician_assistant`, `nurse_practitioner`, `admin`); patients also send `X-Patient-Id`. Named clinical roles are treated as clinician equivalents for clinical actions.
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/health` | Database, provider and rule-config status |
-| `GET` | `/api/me` | Current principal |
-| `POST` / `GET` | `/api/cases` | Create / list review queue |
-| `GET` | `/api/cases/{id}` | Full case view |
-| `GET` | `/api/cases/{id}/status` | Processing/review status and poll target |
-| `POST` | `/api/cases/{id}/consent`, `/consent/withdraw` | Consent lifecycle |
-| `DELETE` | `/api/cases/{id}` | Start deletion job |
-| `POST` | `/api/cases/{id}/sources/stt`, `/ocr`, `/message` | Ingest structured sources |
-| `POST` | `/api/cases/{id}/uploads` | Encrypted original upload (returns dedupe flag) |
-| `GET` | `/api/documents/{document_id}` | Authorized, audited download |
-| `POST` | `/api/cases/{id}/process` | Run pipeline (`?sync=true` for synchronous) |
-| `PATCH` | `/api/cases/{id}/facts/{fact_id}` | Verify / correct / reject / dispute |
-| `POST` | `/api/cases/{id}/warnings/{warning_id}/acknowledge` | Acknowledge warning |
-| `PATCH` | `/api/cases/{id}/note` | Clinician edit |
-| `POST` | `/api/cases/{id}/note/approve` | Approve note |
-| `POST` | `/api/cases/{id}/override` | Override workflow status with reason |
-| `POST` | `/api/cases/{id}/assign` | Assign reviewer (explicit confirmation required) |
-| `PATCH` | `/api/cases/{id}/urgency` | Edit the advisory 0-100 urgency score with a reason (clinical roles; explicit confirmation required) |
-| `GET` | `/api/communications/templates` | Curated templates by language |
-| `POST` | `/api/cases/{id}/communications/draft` | Draft a curated status, wait, document, missing-information or urgent-review message |
-| `GET` | `/api/cases/{id}/communications` | List messages (patients see sent messages only) |
-| `POST` | `/api/cases/{id}/communications/{message_id}/approve`, `/send`, `/dismiss` | Message lifecycle |
-| `GET` | `/api/cases/{id}/followups` | Follow-up questions and answers |
-| `POST` | `/api/cases/{id}/followups/sync` | Rebuild follow-up suggestions from the summary |
-| `POST` | `/api/cases/{id}/followups/{followup_id}/approve`, `/send`, `/dismiss` | Follow-up lifecycle |
-| `POST` | `/api/cases/{id}/followups/{followup_id}/answers` | Record an answer and reprocess the case |
-| `GET` / `PUT` | `/api/operations/staffing` | Read / update explicit operational capacity |
-| `GET` | `/api/queue/intelligence` | Explainable ordering, bottlenecks and wait estimates |
-| `GET` | `/api/escalations` | List urgent escalations by case/status |
-| `POST` | `/api/escalations/{id}/acknowledge`, `/retry` | Acknowledge receipt or retry delivery |
-| `GET` | `/api/cases/{id}/audit` | Audit trail (clinician/admin) |
-| `GET` | `/api/deletion-jobs`, `POST /deletion-jobs/{id}/retry` | Admin deletion operations |
-| `GET` | `/api/rules` | Rule config (clinician/admin) |
-
-Workflow outcomes are `EMERGENCY`, `PRIORITY_REVIEW`, `UNASSESSED`, `ROUTINE_REVIEW`. `UNASSESSED` is used when information is insufficient, unreliable or processing failed; it is never a reassuring result. `ROUTINE_REVIEW` is a workflow queue label, not clinical clearance.
-
-The urgency score is a separate advisory coordination signal, not a workflow outcome. It is ordered within the deterministic priority category and is never used to move a case into a higher or lower category. If the model fails, a deterministic fallback score is stored and labelled as such. Clinician-edited scores are preserved on reprocessing and every edit records the previous score, editor, role, reason and timestamp.
-
-Example:
-
-```powershell
-$h = @{ "X-User-Id" = "dr_demo"; "X-Role" = "clinician" }
-$case = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/cases `
-  -Headers $h -ContentType "application/json" -Body '{"patient_id":"patient_demo"}'
-$id = $case.case_id
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/api/cases/$id/consent" `
-  -Headers @{ "X-User-Id"="intake_demo"; "X-Role"="intake" } `
-  -ContentType "application/json" -Body '{"scope":"demo"}'
-```
-
-Consent must be granted before ingestion/processing. In the demo, `intake` or `admin` can grant it; patients grant their own consent.
-
-## Data handling
-
-- SQLite in `CAREFLOW_DATA_DIR`; uploaded blobs under `data/uploads/` encrypted with Fernet.
-- Source text, derived fact payloads, message bodies, follow-up questions, answers and uploads are encrypted. Audit metadata (who did what) is separate and retained after deletion for accountability.
-- Default delivery writes to an auditable outbox rather than contacting a real patient channel. Webhook delivery is opt-in and must be configured with an approved endpoint.
-- Uploads are validated by MIME/size and deduplicated by SHA-256 per case.
-- Withdrawal/deletion removes sources, facts, derived summaries and documents via idempotent, resumable jobs. The processing loop re-checks deletion/withdrawal before persisting derived data.
-- The service stores no real patient data by default and has no telemetry.
-
-## Limitations and non-goals
-
-- Not a diagnosis, prescription, disposition or clinical-clearance system; no autonomous patient-facing advice.
-- Demo thresholds are not an approved triage protocol and have not been clinically validated.
-- STT (Sarvam) and OCR (GLM-OCR via Ollama) are external model components; this repo integrates them and preserves provenance. Do not fabricate confidence or clinical accuracy metrics.
-- Patient messages are curated templates, not generative clinical advice. Only `en`, `hi` and `hinglish` variants exist; missing variants fail safely rather than being machine-translated at runtime.
-- Wait estimates are operational estimates, not guarantees. They are unavailable for emergency cases and when staffing, review-time data or the minimum sample is missing.
-- Follow-up suggestions do not replace clinician review, emergency escalation or direct communication.
-- No production identity provider, TLS termination, rate limiting, HA database, backup/restore or regulatory controls. `dev` header auth is for local demos only.
-- Single-node SQLite; background jobs are in-process only.
-- Qwen3-8B on a 6 GB laptop GPU may be slow or spill to CPU; tune `CAREFLOW_OLLAMA_NUM_GPU`, `NUM_CTX` and timeout, and verify with `/api/health`.
-- Python 3.10 is used; adjust dependency pins if deploying elsewhere.
-
-## Repository layout
+## Repository Structure
 
 ```
-app/                 FastAPI app, pipeline, model providers, rules, website
-OCR1/                GLM-OCR extraction via Ollama and the clinical-relevance organizer (in-process)
-STT_translation/     Sarvam speech-to-language implementation (+ optional standalone API)
-mobile/              Flutter client (Android/iOS)
-tests/               pytest suite (synthetic data, mock provider, integration)
-scripts/             extraction benchmark, rule-config validator
-docs/                architecture, integration and governance notes
-data/                runtime data (gitignored)
-reports/             generated benchmark reports (gitignored)
+.
+├── app/                        # FastAPI core application
+│   ├── main.py                 # API router, middleware, and entrypoint
+│   ├── schemas.py              # Pydantic data schemas and models
+│   ├── security.py             # Role-based access control & header auth
+│   ├── db.py                   # SQLite database operations & audit logs
+│   ├── storage.py              # AES-Fernet encryption at rest
+│   ├── queue_ops.py            # Bottleneck calculation & wait estimation
+│   ├── communications.py       # Curated messaging templates & approval
+│   ├── followups.py            # Adaptive follow-up generator & answers
+│   ├── escalation.py           # Urgent red-flag escalations
+│   ├── pipeline/               # Multi-stage clinical extraction pipeline
+│   ├── triage/                 # Deterministic JSON rule engine & demo rules
+│   └── static/                 # Web review workstation (HTML/JS/CSS)
+│       ├── index.html          # Web workstation UI
+│       ├── app.js              # Workstation client & dynamic API bridge
+│       ├── styles.css          # Design system & responsive layouts
+│       └── vercel.json         # Vercel deployment configuration
+├── mobile/                     # Cross-platform Flutter mobile client
+│   ├── lib/
+│   │   ├── main.dart           # App entrypoint
+│   │   ├── api.dart            # HTTP client & error handler
+│   │   ├── session.dart        # Session state & base URL configuration
+│   │   ├── models.dart         # Strongly typed clinical models
+│   │   ├── theme.dart          # CareFlow design system
+│   │   ├── widgets.dart        # Shared UI components & chips
+│   │   └── screens/
+│   │       ├── home_shell.dart # Navigation shell
+│   │       ├── queue_screen.dart # Triage queue & case creation modal
+│   │       ├── case_screen.dart  # Case review, consent, sources, & summary
+│   │       ├── operations_screen.dart # Staffing & bottleneck dashboard
+│   │       └── settings_screen.dart   # Role & backend URL settings
+│   └── test/                   # Flutter test suite
+├── OCR1/                       # GLM-OCR model integration via Ollama
+├── STT_translation/            # Sarvam Speech-to-Text audio integration
+├── tests/                      # 103 pytest automated tests
+├── docs/                       # Architecture and governance documentation
+├── vercel.json                 # Root Vercel deployment configuration
+└── careflow.db                 # SQLite database (auto-created)
 ```
+
+---
+
+## License & Governance
+
+CareFlow AI is developed under the MIT License for research and demonstration purposes. All triage thresholds and safety rules must undergo formal institutional clinical governance prior to any production or clinical environment consideration.

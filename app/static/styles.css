@@ -86,6 +86,17 @@ a { color: var(--accent); }
   font-size: .8rem;
 }
 .identity input::placeholder { color: #91adb7; }
+.api-bridge { display: flex; gap: .45rem; align-items: center; }
+.api-bridge input {
+  padding: .48rem .62rem;
+  border-radius: 9px;
+  border: 1px solid rgba(180, 215, 216, .24);
+  background: rgba(5, 23, 34, .42);
+  color: #f4fbfc;
+  font-size: .8rem;
+  min-width: 220px;
+}
+.api-bridge input::placeholder { color: #91adb7; }
 .disclaimer {
   background: #fff8e7;
   border-bottom: 1px solid #ead9ae;

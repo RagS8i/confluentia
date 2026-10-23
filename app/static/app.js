@@ -51,6 +51,54 @@ function identityHeaders() {
   return headers;
 }
 
+function getApiBaseUrl() {
+  try {
+    const urlParam = new URLSearchParams(window.location.search).get("api");
+    if (urlParam) {
+      const clean = urlParam.replace(/\/+$/, "");
+      localStorage.setItem("careflow.apiUrl", clean);
+      return clean;
+    }
+    const saved = localStorage.getItem("careflow.apiUrl");
+    if (saved) return saved.replace(/\/+$/, "");
+  } catch (_) {}
+  return "";
+}
+
+function setApiBaseUrl(url) {
+  const clean = (url || "").trim().replace(/\/+$/, "");
+  try {
+    if (clean) {
+      localStorage.setItem("careflow.apiUrl", clean);
+    } else {
+      localStorage.removeItem("careflow.apiUrl");
+    }
+  } catch (_) {}
+  checkApiHealth();
+}
+
+async function checkApiHealth() {
+  const el = $("api-status-pill");
+  if (!el) return;
+  el.textContent = "connecting...";
+  el.className = "badge PRIORITY_REVIEW";
+  try {
+    const base = getApiBaseUrl();
+    const endpoint = base ? `${base}/api/health` : "/api/health";
+    const res = await fetch(endpoint);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const model = data.provider && data.provider.model ? data.provider.model : "";
+    el.textContent = model ? `online (${model})` : "online";
+    el.className = "badge ROUTINE_REVIEW";
+    el.title = `Connected to CareFlow backend (${base || "local origin"})`;
+  } catch (err) {
+    el.textContent = "offline";
+    el.className = "badge EMERGENCY";
+    el.title = `Cannot reach backend at ${getApiBaseUrl() || window.location.origin}. Check backend URL and port-forwarding.`;
+  }
+}
+
 async function api(path, options = {}) {
   const opts = { ...options };
   const headers = { ...identityHeaders(), ...(options.headers || {}) };
@@ -59,7 +107,9 @@ async function api(path, options = {}) {
     opts.body = JSON.stringify(opts.body);
   }
   opts.headers = headers;
-  const response = await fetch(`/api${path}`, opts);
+  const base = getApiBaseUrl();
+  const endpoint = base ? `${base}/api${path}` : `/api${path}`;
+  const response = await fetch(endpoint, opts);
   const text = await response.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = { detail: text }; }
@@ -908,7 +958,14 @@ function startIntakeJobPolling(jobId, kind, autoProcess) {
             : "";
           msgEl.textContent = `Completed! ${job.result?.inserted || 0} source(s) inserted.${timingText}`;
         }
-        else if (job.status === "failed") msgEl.textContent = `Error: ${job.error || "Intake processing failed."}`;
+        else if (job.status === "failed") {
+          const isNonMedical = (job.error || "").toLowerCase().includes("non-medical") || (job.error || "").toLowerCase().includes("clinically relevant");
+          if (isNonMedical) {
+            msgEl.textContent = "Rejected: OCR read the document, but the AI clinical safety gate detected no medical content (e.g. ticket, receipt, or general document). Please upload a clinical report, lab slip, or prescription.";
+          } else {
+            msgEl.textContent = `Error: ${job.error || "Intake processing failed."}`;
+          }
+        }
       }
 
       if (job.status === "complete") {
@@ -930,7 +987,12 @@ function startIntakeJobPolling(jobId, kind, autoProcess) {
         if (cpuWarning) cpuWarning.hidden = true;
         $("submit-audio-btn").disabled = false;
         $("submit-doc-btn").disabled = false;
-        notify(`Intake failed: ${job.error || "Unknown error"}`, true);
+        const isNonMedical = (job.error || "").toLowerCase().includes("non-medical") || (job.error || "").toLowerCase().includes("clinically relevant");
+        if (isNonMedical) {
+          notify("Non-medical document rejected: Please upload a clinical report or prescription.", true);
+        } else {
+          notify(`Intake failed: ${job.error || "Unknown error"}`, true);
+        }
       }
     } catch (err) {
       clearInterval(state.intakeJobTimer);
@@ -1391,6 +1453,26 @@ function wire() {
     $("patient-id").style.display = $("role").value === "patient" ? "" : "none";
   });
 
+  // API Bridge wiring
+  const apiInput = $("api-url");
+  if (apiInput) {
+    apiInput.value = localStorage.getItem("careflow.apiUrl") || "";
+    $("save-api-url").addEventListener("click", () => {
+      setApiBaseUrl(apiInput.value);
+      loadQueue();
+      loadIntelligence();
+      if (state.caseId) loadCase(state.caseId, false);
+    });
+    apiInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        setApiBaseUrl(apiInput.value);
+        loadQueue();
+        loadIntelligence();
+        if (state.caseId) loadCase(state.caseId, false);
+      }
+    });
+  }
+
   // Direct intake wiring
   document.querySelectorAll(".intake-tab").forEach((button) => {
     button.addEventListener("click", () => switchIntakeTab(button.dataset.tab));
@@ -1405,6 +1487,7 @@ function wire() {
 loadIdentity();
 wire();
 $("patient-id").style.display = state.identity.role === "patient" ? "" : "none";
+checkApiHealth();
 updateIntakeGate();
 loadQueue();
 loadIntelligence();

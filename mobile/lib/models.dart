@@ -426,6 +426,10 @@ class CaseDetail {
     required this.sources,
     required this.queueEstimate,
     this.urgency,
+    this.consentGrantedAt,
+    this.consentScope,
+    this.consentWithdrawnAt,
+    this.note,
   });
 
   final String caseId;
@@ -443,6 +447,13 @@ class CaseDetail {
   final List<Map<String, dynamic>> sources;
   final WaitEstimate? queueEstimate;
   final UrgencyAssessment? urgency;
+  final String? consentGrantedAt;
+  final String? consentScope;
+  final String? consentWithdrawnAt;
+  final Map<String, dynamic>? note;
+
+  bool get hasConsent => consentGrantedAt != null && consentWithdrawnAt == null;
+  bool get isConsentWithdrawn => consentWithdrawnAt != null;
 
   factory CaseDetail.fromJson(dynamic json) {
     final data = mapValue(json);
@@ -475,6 +486,10 @@ class CaseDetail {
       urgency: caseMap['urgency'] == null
           ? null
           : UrgencyAssessment.fromJson(caseMap['urgency']),
+      consentGrantedAt: caseMap['consent_granted_at']?.toString(),
+      consentScope: caseMap['consent_scope']?.toString(),
+      consentWithdrawnAt: caseMap['consent_withdrawn_at']?.toString(),
+      note: data['note'] == null ? null : mapValue(data['note']),
     );
   }
 }

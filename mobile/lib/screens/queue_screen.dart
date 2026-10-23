@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 
 import '../api.dart';
 import '../models.dart';
@@ -58,56 +58,146 @@ class _QueueScreenState extends State<QueueScreen> {
   }
 
   Future<void> _createCase() async {
-    final controller = TextEditingController(text: widget.session.patientId);
+    final patientController = TextEditingController(
+      text: widget.session.isPatient ? widget.session.patientId : '',
+    );
+    final symptomsController = TextEditingController();
+    bool grantConsent = true;
+    bool autoProcess = true;
+
     final created = await showDialog<bool>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Register a case'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              widget.session.isPatient
-                  ? 'A new case will be linked to your patient identity.'
-                  : 'Enter the patient identifier for the new intake.',
-              style: const TextStyle(fontSize: 13, color: Color(0xFF647A86)),
-            ),
-            if (!widget.session.isPatient) ...[
-              const SizedBox(height: 14),
-              TextField(
-                controller: controller,
-                autofocus: true,
-                decoration: const InputDecoration(labelText: 'Patient ID'),
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Register a case'),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.session.isPatient
+                        ? 'A new case will be linked to your patient identity.'
+                        : 'Enter the patient identifier and initial clinical intake details.',
+                    style: const TextStyle(fontSize: 13, color: Color(0xFF647A86)),
+                  ),
+                  if (!widget.session.isPatient) ...[
+                    const SizedBox(height: 14),
+                    TextField(
+                      controller: patientController,
+                      autofocus: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Patient ID',
+                        hintText: 'e.g. patient_102',
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: symptomsController,
+                    minLines: 3,
+                    maxLines: 6,
+                    decoration: const InputDecoration(
+                      labelText: 'Initial symptoms / case details (optional)',
+                      hintText:
+                          'Describe chief complaint, symptoms, onset, or medical history...',
+                      alignLabelWithHint: true,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    title: const Text(
+                      'Record patient consent',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    subtitle: const Text(
+                      'Required before AI intake, transcription, and triage',
+                      style: TextStyle(fontSize: 11, color: Color(0xFF647A86)),
+                    ),
+                    value: grantConsent,
+                    onChanged: (val) =>
+                        setDialogState(() => grantConsent = val),
+                  ),
+                  if (grantConsent)
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: const Text(
+                        'Run processing immediately',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      subtitle: const Text(
+                        'Extract facts, advisory urgency, and clinical summary',
+                        style: TextStyle(fontSize: 11, color: Color(0xFF647A86)),
+                      ),
+                      value: autoProcess,
+                      onChanged: (val) =>
+                          setDialogState(() => autoProcess = val),
+                    ),
+                ],
               ),
-            ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Create & open'),
+            ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Create'),
-          ),
-        ],
       ),
     );
     if (created != true) return;
     try {
+      final patientId = widget.session.isPatient
+          ? widget.session.patientId
+          : patientController.text.trim();
       final data = await widget.api.post(
         '/api/cases',
         body: {
-          'patient_id': widget.session.isPatient
-              ? widget.session.patientId
-              : controller.text.trim(),
+          'patient_id': patientId.isEmpty ? 'patient_anonymous' : patientId,
         },
       );
       final caseMap = mapValue(data);
       final caseId = textValue(caseMap['case_id']);
       if (!mounted || caseId.isEmpty) return;
+
+      if (grantConsent) {
+        try {
+          await widget.api.post(
+            '/api/cases/$caseId/consent',
+            body: {'scope': 'careflow_processing_and_review'},
+          );
+        } catch (_) {}
+      }
+
+      final symptoms = symptomsController.text.trim();
+      if (symptoms.isNotEmpty && grantConsent) {
+        try {
+          await widget.api.post(
+            '/api/cases/$caseId/sources/message',
+            body: {'text': symptoms},
+          );
+          if (autoProcess) {
+            await widget.api.post('/api/cases/$caseId/process?sync=true');
+          }
+        } catch (_) {}
+      }
+
       await _openCase(caseId);
     } on ApiException catch (error) {
       if (!mounted) return;
@@ -294,9 +384,9 @@ class _QueueScreenState extends State<QueueScreen> {
                             ),
                             const SizedBox(height: 3),
                             Text(
-                              '${item.workflowStatus.replaceAll('_', ' ')} Â· '
-                              'consent ${item.consent} Â· '
-                              '${item.urgencyScore != null ? 'urgency ${item.urgencyScore}/100 Â· ' : ''}'
+                              '${item.workflowStatus.replaceAll('_', ' ')} · '
+                              'consent ${item.consent} · '
+                              '${item.urgencyScore != null ? 'urgency ${item.urgencyScore}/100 · ' : ''}'
                               '${item.warningCount} warning(s)',
                               style: const TextStyle(
                                 fontSize: 11.5,
@@ -516,10 +606,10 @@ class _QueueCaseCard extends StatelessWidget {
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          '${item.patientId} Â· '
+                          '${item.patientId} · '
                           '${item.workflowStatus.replaceAll('_', ' ')}'
-                          '${item.urgencyScore != null ? ' Â· urgency ${item.urgencyScore}/100' : ''}'
-                          '${item.awaitingMinutes != null ? ' Â· ${item.awaitingMinutes} min awaiting' : ''}',
+                          '${item.urgencyScore != null ? ' · urgency ${item.urgencyScore}/100' : ''}'
+                          '${item.awaitingMinutes != null ? ' · ${item.awaitingMinutes} min awaiting' : ''}',
                           style: const TextStyle(
                             fontSize: 11,
                             color: Color(0xFF647A86),

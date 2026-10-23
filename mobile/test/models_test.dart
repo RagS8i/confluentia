@@ -64,6 +64,8 @@ void main() {
         'status': 'processed',
         'workflow_status': 'PRIORITY_REVIEW',
         'meta': {'assigned_reviewer': 'dr_a'},
+        'consent_granted_at': '2026-10-20T10:00:00Z',
+        'consent_scope': 'careflow_processing_and_review',
       },
       'communications': [
         {
@@ -119,6 +121,8 @@ void main() {
     expect(detail.answers.single.text, 'Better than yesterday.');
     expect(detail.escalations.single.triggerLabel, 'Emergency red flag');
     expect(detail.meta['assigned_reviewer'], 'dr_a');
+    expect(detail.hasConsent, isTrue);
+    expect(detail.consentScope, 'careflow_processing_and_review');
   });
 
   test('case summaries parse the paginated API envelope', () {
