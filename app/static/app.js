@@ -51,22 +51,31 @@ function identityHeaders() {
   return headers;
 }
 
+function normalizeApiUrl(raw) {
+  if (!raw) return "";
+  let clean = raw.trim().replace(/\/+$/, "");
+  if (clean.endsWith("/api")) {
+    clean = clean.slice(0, -4).replace(/\/+$/, "");
+  }
+  return clean;
+}
+
 function getApiBaseUrl() {
   try {
     const urlParam = new URLSearchParams(window.location.search).get("api");
     if (urlParam) {
-      const clean = urlParam.replace(/\/+$/, "");
+      const clean = normalizeApiUrl(urlParam);
       localStorage.setItem("careflow.apiUrl", clean);
       return clean;
     }
     const saved = localStorage.getItem("careflow.apiUrl");
-    if (saved) return saved.replace(/\/+$/, "");
+    if (saved) return normalizeApiUrl(saved);
   } catch (_) {}
   return "";
 }
 
 function setApiBaseUrl(url) {
-  const clean = (url || "").trim().replace(/\/+$/, "");
+  const clean = normalizeApiUrl(url);
   try {
     if (clean) {
       localStorage.setItem("careflow.apiUrl", clean);
@@ -74,6 +83,8 @@ function setApiBaseUrl(url) {
       localStorage.removeItem("careflow.apiUrl");
     }
   } catch (_) {}
+  const input = $("api-url");
+  if (input) input.value = clean;
   checkApiHealth();
 }
 
@@ -85,9 +96,17 @@ async function checkApiHealth() {
   try {
     const base = getApiBaseUrl();
     const endpoint = base ? `${base}/api/health` : "/api/health";
-    const res = await fetch(endpoint);
+    const res = await fetch(endpoint, {
+      headers: {
+        "ngrok-skip-browser-warning": "true",
+      },
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const text = await res.text();
+    if (text.trim().startsWith("<")) {
+      throw new Error("Received HTML instead of JSON. Ensure your tunnel is pointing to port 8000.");
+    }
+    const data = JSON.parse(text);
     const model = data.provider && data.provider.model ? data.provider.model : "";
     el.textContent = model ? `online (${model})` : "online";
     el.className = "badge ROUTINE_REVIEW";
@@ -95,13 +114,17 @@ async function checkApiHealth() {
   } catch (err) {
     el.textContent = "offline";
     el.className = "badge EMERGENCY";
-    el.title = `Cannot reach backend at ${getApiBaseUrl() || window.location.origin}. Check backend URL and port-forwarding.`;
+    el.title = `Cannot reach backend at ${getApiBaseUrl() || window.location.origin}: ${err.message}`;
   }
 }
 
 async function api(path, options = {}) {
   const opts = { ...options };
-  const headers = { ...identityHeaders(), ...(options.headers || {}) };
+  const headers = {
+    ...identityHeaders(),
+    "ngrok-skip-browser-warning": "true",
+    ...(options.headers || {}),
+  };
   if (opts.body && !(opts.body instanceof FormData)) {
     headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(opts.body);
