@@ -57,18 +57,27 @@ class _HomeShellState extends State<HomeShell> {
         titleSpacing: 18,
         title: Row(
           children: [
-            Container(
-              width: 34,
-              height: 34,
-              decoration: BoxDecoration(
-                color: careFlowNavy,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              alignment: Alignment.center,
-              child: const Icon(
-                Icons.monitor_heart_outlined,
-                color: careFlowMint,
-                size: 21,
+            ClipRRect(
+              borderRadius: BorderRadius.circular(9),
+              child: Image.asset(
+                'assets/logo.png',
+                width: 34,
+                height: 34,
+                fit: BoxFit.cover,
+                errorBuilder: (context, error, stackTrace) => Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    color: careFlowNavy,
+                    borderRadius: BorderRadius.circular(9),
+                  ),
+                  alignment: Alignment.center,
+                  child: const Icon(
+                    Icons.monitor_heart_outlined,
+                    color: careFlowMint,
+                    size: 21,
+                  ),
+                ),
               ),
             ),
             const SizedBox(width: 10),

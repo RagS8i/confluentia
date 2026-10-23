@@ -64,17 +64,13 @@ a { color: var(--accent); }
 .brand { display: flex; align-items: center; gap: .85rem; }
 .brand p { color: #abc3cc; font-size: .78rem; margin: .1rem 0 0; }
 .brand h1 span { color: #78d3c5; font-weight: 500; }
-.logo {
+.brand-logo {
   width: 44px;
   height: 44px;
-  border-radius: 13px;
-  display: grid;
-  place-items: center;
-  font-weight: 800;
-  letter-spacing: .05em;
-  color: #062c2a;
-  background: linear-gradient(145deg, #a4f0e3, #54bbaa);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .55);
+  border-radius: 12px;
+  object-fit: cover;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .35), 0 0 10px rgba(120, 211, 197, .25);
+  display: block;
 }
 .identity { display: flex; gap: .45rem; flex-wrap: wrap; align-items: center; }
 .identity input, .identity select {
